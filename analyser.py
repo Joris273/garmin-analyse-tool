@@ -32,50 +32,65 @@ def fetch_garmin_raw(email, password, start_date, end_date):
     try:
         client = Garmin(email, password)
         client.login()
+        # Hole alle Aktivitäten, Filterung erfolgt später
         activities = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat(), "")
         return activities, None
     except Exception as e:
+        # Fehlerbehandlung für Auth-Fehler oder API-Probleme
         return [], str(e)
 
-# --- Helfer ---
+# --- Helfer: Robuste Datenextraktion ---
 def robust_get(activity, keys):
+    """Sucht einen Wert unter verschiedenen Schlüsseln und wandelt ihn sicher in float um."""
     for key in keys:
         val = activity.get(key)
         if val is not None:
             try:
                 float_val = float(val)
+                # Wir akzeptieren auch 0 (z.B. bei Distanz oder Höhe)
                 if float_val >= 0: return float_val 
-            except: continue
+            except (ValueError, TypeError): 
+                continue
     return None
 
 def calculate_trimp(duration_min, avg_hr, max_hr):
+    """Berechnet TRIMP Score. Fallback, falls max_hr unsinnig ist."""
     if not max_hr or max_hr < 100: max_hr = 190 
     intensity = avg_hr / max_hr
+    # Banister-Formel Gewichtung
     weighted_intensity = intensity * np.exp(1.92 * intensity) 
     return duration_min * weighted_intensity
 
 def determine_smart_zone(avg_hr, max_hr_activity, user_max_hr):
     """
     Bestimmt die Zone intelligent. Erkennt Intervalle (niedriger Avg, hoher Max)
-    und stuft diese entsprechend hoch, damit sie nicht als "Grundlage" verfälscht werden.
+    und stuft diese entsprechend hoch.
     """
     if not user_max_hr or user_max_hr < 100: return 0, "Z?"
     
     avg_pct = avg_hr / user_max_hr
+    # Fallback: Wenn kein MaxHF der Aktivität da ist, nimm Avg (konservativ)
     max_pct = max_hr_activity / user_max_hr if max_hr_activity else avg_pct
     
-    # Standard Zonen (nach Coggan/Friel grob angenähert für HR)
-    if avg_pct < 0.60: zone_idx = 0
-    elif avg_pct < 0.75: zone_idx = 1 
-    elif avg_pct < 0.85: zone_idx = 2
-    elif avg_pct < 0.95: zone_idx = 3
-    else: zone_idx = 4
+    # Basis-Klassifizierung nach Durchschnitt (Coggan/Friel HR Zones approximiert)
+    if avg_pct < 0.60: zone_idx = 0      # Z1 Active Recovery
+    elif avg_pct < 0.75: zone_idx = 1    # Z2 Endurance
+    elif avg_pct < 0.85: zone_idx = 2    # Z3 Tempo
+    elif avg_pct < 0.95: zone_idx = 3    # Z4 Threshold
+    else: zone_idx = 4                   # Z5 VO2max
     
-    # INTELLIGENTE KORREKTUR FÜR INTERVALLE
+    # SMART INTERVAL DETECTION
+    # Logik: Wenn der Max-Puls sehr hoch war, der Schnitt aber niedrig,
+    # war es wahrscheinlich ein Intervalltraining mit Pausen.
+    # Wir werten das NICHT als reine Grundlage (Z1/Z2), sondern als Belastung.
+    
+    # Fall 1: Max Puls war VO2max (>92%), aber Schnitt suggeriert Tempo oder niedriger
     if max_pct > 0.92 and zone_idx < 3:
-        zone_idx = 3 # Upgrade auf mindestens "Threshold/Hard" (Z4)
+        zone_idx = 3 # Upgrade auf mindestens Threshold (Z4)
+        
+    # Fall 2: Max Puls war Threshold (>88%), aber Schnitt suggeriert Grundlage
     elif max_pct > 0.88 and zone_idx < 2:
-        zone_idx = 2 # Upgrade auf mindestens "Tempo" (Z3)
+        zone_idx = 2 # Upgrade auf mindestens Tempo (Z3)
 
     labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
     return zone_idx, labels[zone_idx]
@@ -89,39 +104,54 @@ def process_data(raw_activities, user_max_hr):
         act_type = activity.get('activityType', {}).get('typeKey', 'unknown')
         act_name = activity.get('activityName', 'Unbekannt')
         
+        # Filter: Alles was Räder hat
         is_cycling = any(x in act_type.lower() for x in ['cycling', 'biking', 'ride', 'gravel', 'mtb', 'virtual'])
         if not is_cycling: continue
 
+        # Daten sicher extrahieren
         avg_power = robust_get(activity, ['avgPower', 'averagePower', 'normPower'])
         max_20min = robust_get(activity, ['max20MinPower', 'maximum20MinPower', 'twentyMinPower'])
         
         avg_hr = robust_get(activity, ['avgHR', 'averageHR', 'avgHeartRate', 'averageHeartRate'])
         max_hr_activity = robust_get(activity, ['maxHR', 'maxHeartRate', 'maximumHeartRate'])
         
-        duration = round(activity.get('duration', 0) / 60, 1)
+        duration_s = activity.get('duration', 0)
+        duration_min = round(duration_s / 60, 1)
         calories = robust_get(activity, ['calories', 'totalCalories'])
         
-        distance = robust_get(activity, ['distance']) 
-        elevation = robust_get(activity, ['totalAscent', 'elevationGain'])
+        distance_m = robust_get(activity, ['distance']) 
+        elevation_m = robust_get(activity, ['totalAscent', 'elevationGain'])
 
-        if avg_hr and duration > 5:
+        # Validierung: Einheit muss HF haben und > 5 Min sein
+        if avg_hr and duration_min > 5:
+            # Werte bereinigen
             power_val = int(avg_power) if avg_power else None
             max_20min_val = int(max_20min) if max_20min else 0
-            stress_score = calculate_trimp(duration, avg_hr, user_max_hr)
             
+            # TRIMP Score berechnen
+            stress_score = calculate_trimp(duration_min, avg_hr, user_max_hr)
+            
+            # Smart Zone bestimmen
             zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, user_max_hr)
             
-            dist_km = round(distance / 1000, 1) if distance else 0.0
-            elev_m = int(elevation) if elevation else 0
+            dist_km = round(distance_m / 1000, 1) if distance_m else 0.0
+            elev_m = int(elevation_m) if elevation_m else 0
+            
+            # Sicheres Datum-Parsing
+            try:
+                date_str = activity['startTimeLocal'].split(' ')[0]
+                date_obj = pd.to_datetime(date_str)
+            except:
+                continue # Überspringe Datensätze mit defektem Datum
 
             data.append({
-                "Datum": pd.to_datetime(activity['startTimeLocal'].split(' ')[0]),
+                "Datum": date_obj,
                 "Aktivität": act_name,
                 "Leistung": power_val,
                 "Max20Min": max_20min_val,
                 "HF": int(avg_hr),
                 "MaxHF": int(max_hr_activity) if max_hr_activity else int(avg_hr),
-                "Dauer_Min": duration,
+                "Dauer_Min": duration_min,
                 "Stress": round(stress_score, 1),
                 "ZoneIdx": zone_idx,
                 "Zone": zone_label,
@@ -208,27 +238,78 @@ def generate_demo_data(days=120):
 
 with st.sidebar:
     st.header("⚙️ Setup")
-    tab_login, tab_params = st.tabs(["Login", "Parameter"])
+    tab_login, tab_params = st.tabs(["Daten", "Parameter"])
+    
     with tab_login:
         st.info("🔒 **Datenschutz:** Deine Zugangsdaten werden **nur** für die Verbindung zu Garmin genutzt und **nicht gespeichert**. Alles läuft sicher im Arbeitsspeicher.")
         email = st.text_input("Garmin E-Mail")
         password = st.text_input("Passwort", type="password")
+        
+        st.markdown("### 1. Zeitraum wählen")
+        
+        range_options = {
+            "Letzte 30 Tage": 30,
+            "Letzte 90 Tage": 90,
+            "Letzte 180 Tage": 180,
+            "Letzte 365 Tage": 365,
+            "Dieses Jahr": "cy",
+            "Letztes Jahr": "ly"
+        }
+        selected_range = st.selectbox("Datenbasis", list(range_options.keys()), index=1, help="Wähle den Zeitraum für den Datenabruf.")
+        
         today = datetime.date.today()
-        default_start = today - datetime.timedelta(days=120)
-        date_range = st.date_input("Zeitraum", [default_start, today])
-        st.caption("ℹ️ Daten werden temporär (60min) gecached, damit du schneller analysieren kannst.")
+        val = range_options[selected_range]
+        
+        if val == "cy":
+            start_date = datetime.date(today.year, 1, 1)
+            end_date = today
+        elif val == "ly":
+            start_date = datetime.date(today.year - 1, 1, 1)
+            end_date = datetime.date(today.year - 1, 12, 31)
+        else:
+            start_date = today - datetime.timedelta(days=val)
+            end_date = today
+        
         col1, col2 = st.columns(2)
         start_btn = col1.button("Start", type="primary")
         demo_btn = col2.button("Demo")
+        
     with tab_params:
-        st.subheader("Deine Physiologie")
+        st.subheader("2. Analyse-Fokus")
+        st.caption("Wie möchtest du die geladenen Daten vergleichen?")
+        
         user_max_hr = st.number_input("Max Herzfrequenz", 100, 220, 161, help="Beeinflusst Zonen & Stress-Score.")
-        st.subheader("Analyse Einstellungen")
-        comparison_weeks = st.slider("Vergleichs-Fenster (Wochen)", 2, 12, 4)
+        
+        # DYNAMISCHE SLIDER-BERECHNUNG (KORRIGIERT)
+        # Standardwert basierend auf Auswahl (falls noch keine Daten da sind)
+        days_diff = (end_date - start_date).days
+        
+        # WICHTIG: Wenn wir schon Daten im Speicher haben, orientieren wir uns an DENEN,
+        # nicht an der neuen Auswahl (die noch nicht geladen wurde).
+        # Das verhindert, dass der Slider springt, wenn man nur in der Sidebar klickt.
+        if 'df' in st.session_state and st.session_state.df is not None and not st.session_state.df.empty:
+             min_dt = st.session_state.df['Datum'].min().date()
+             max_dt = st.session_state.df['Datum'].max().date()
+             days_diff = (max_dt - min_dt).days
+        
+        weeks_total = max(1, days_diff // 7)
+        max_possible_weeks = max(2, int(weeks_total / 2))
+        
+        # Sicherstellen, dass Standardwert gültig ist
+        default_weeks = min(4, max_possible_weeks)
+        
+        comparison_weeks = st.slider(
+            "Fenstergröße (Wochen)", 
+            min_value=1, 
+            max_value=max_possible_weeks, 
+            value=default_weeks, 
+            help="Bestimmt die Größe der Vergleichsblöcke. Beispiel: Bei '4 Wochen' vergleichen wir die ERSTEN 4 Wochen mit den LETZTEN 4 Wochen deines Zeitraums."
+        )
+        
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
 
-st.title("🚴 Garmin Science Lab V7.4")
+st.title("🚴 Garmin Science Lab V9.1")
 st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
 with st.expander("📘 Wissenschaftlicher Guide: Anleitung zur Interpretation (Hier klicken)"):
@@ -265,9 +346,9 @@ with st.expander("📘 Wissenschaftlicher Guide: Anleitung zur Interpretation (H
 # --- Logic ---
 if 'df' not in st.session_state: st.session_state.df = None
 
-if start_btn and email and password and len(date_range) == 2:
+if start_btn and email and password:
     with st.spinner("Lade Daten..."):
-        raw, err = fetch_garmin_raw(email, password, date_range[0], date_range[1])
+        raw, err = fetch_garmin_raw(email, password, start_date, end_date)
         if err: st.error(err)
         else:
             processed = process_data(raw, user_max_hr)
@@ -276,14 +357,14 @@ if start_btn and email and password and len(date_range) == 2:
                 st.success(f"{len(processed)} Aktivitäten geladen.")
             else: st.warning("Keine Rad-Daten gefunden.")
 elif demo_btn:
-    st.session_state.df = generate_demo_data()
+    st.session_state.df = generate_demo_data(days=90)
 
 # --- DASHBOARD ---
 if st.session_state.df is not None:
     df = st.session_state.df.copy()
     
-    # Highscores
-    st.markdown("### 🏆 Bestwerte (Gewählter Zeitraum)")
+    # Highscores (Dynamisch)
+    st.markdown(f"### 🏆 Bestwerte (Im gesamten Zeitraum)")
     m1, m2, m3, m4 = st.columns(4)
     
     if 'Max20Min' in df and df['Max20Min'].max() > 0:
@@ -313,7 +394,7 @@ if st.session_state.df is not None:
 
     # --- TAB 1 ---
     with tab1:
-        st.caption(f"Vergleich Start ({comparison_weeks} Wo.) vs. Ende ({comparison_weeks} Wo.).")
+        st.caption(f"Vergleich: Erste {comparison_weeks} Wochen vs. Letzte {comparison_weeks} Wochen deiner Daten.")
         df_power = df.dropna(subset=['Leistung']).copy()
         
         if not df_power.empty:
@@ -321,7 +402,7 @@ if st.session_state.df is not None:
             split_early = min_d + datetime.timedelta(weeks=comparison_weeks)
             split_late = max_d - datetime.timedelta(weeks=comparison_weeks)
             
-            df_power['Phase'] = df_power['Datum'].apply(lambda d: "1. Start" if d <= split_early else ("2. Ende" if d >= split_late else "Mitte"))
+            df_power['Phase'] = df_power['Datum'].apply(lambda d: "1. Start-Phase" if d <= split_early else ("2. End-Phase" if d >= split_late else "Mitte"))
             df_compare = df_power[df_power['Phase'] != "Mitte"]
 
             chart = alt.Chart(df_compare).mark_circle(size=80).encode(
@@ -334,7 +415,7 @@ if st.session_state.df is not None:
             st.altair_chart(chart + lines, width="stretch")
             
             c1, c2 = st.columns(2)
-            c1.info("Ziel: Orange Linie rechts unterhalb der blauen.")
+            c1.info("Ziel: Die orange Linie (End-Phase) sollte rechts unterhalb der blauen Linie (Start-Phase) liegen.")
             
             df_zone = df_power[(df_power['HF'] >= target_hr - hr_tol) & (df_power['HF'] <= target_hr + hr_tol)]
             if len(df_zone) > 1:
@@ -349,10 +430,15 @@ if st.session_state.df is not None:
 
     # --- TAB 2 ---
     with tab2:
+        # Resampling und ACWR Berechnung (Robust gegen Nullen)
         daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
         daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
         daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
-        daily['ACWR'] = (daily['Acute'] / daily['Chronic']).fillna(0)
+        
+        # Vermeidung von Division durch Null oder Inf
+        daily['ACWR'] = daily['Acute'] / daily['Chronic']
+        daily['ACWR'] = daily['ACWR'].replace([np.inf, -np.inf], 0).fillna(0)
+        
         daily = daily.reset_index()
 
         base = alt.Chart(daily).encode(x='Datum')
@@ -377,7 +463,7 @@ if st.session_state.df is not None:
 
     # --- TAB 4 ---
     with tab4:
-        st.subheader(f"Intensitäts-Verteilung: Letzte {comparison_weeks} Wochen")
+        st.subheader(f"Intensitäts-Verteilung (Fokus: Letzte {comparison_weeks} Wochen)")
         
         max_date_in_data = df['Datum'].max()
         start_analysis = max_date_in_data - datetime.timedelta(weeks=comparison_weeks)
