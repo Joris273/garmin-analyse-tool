@@ -32,26 +32,34 @@ def fetch_garmin_raw(email, password, start_date, end_date):
     try:
         client = Garmin(email, password)
         client.login()
+        # Hole alle Aktivitäten, Filterung erfolgt später
         activities = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat(), "")
         return activities, None
     except Exception as e:
         return [], str(e)
 
-# --- Helfer ---
+# --- Helfer: Robuste Datenextraktion ---
 def robust_get(activity, keys):
+    """Sucht einen Wert unter verschiedenen Schlüsseln und wandelt ihn sicher in float um."""
     for key in keys:
         val = activity.get(key)
         if val is not None:
             try:
                 float_val = float(val)
+                # Wir akzeptieren auch 0 (z.B. bei Distanz oder Höhe), filtern aber später auf >0 bei HR/Power
                 if float_val >= 0: return float_val 
             except (ValueError, TypeError): 
                 continue
     return None
 
 def calculate_trimp(duration_min, avg_hr, max_hr):
+    """Berechnet TRIMP Score. Fallback, falls max_hr unsinnig ist."""
+    if not isinstance(duration_min, (int, float)) or not isinstance(avg_hr, (int, float)):
+        return 0
     if not max_hr or max_hr < 100: max_hr = 190 
+    
     intensity = avg_hr / max_hr
+    # Banister-Formel Gewichtung
     weighted_intensity = intensity * np.exp(1.92 * intensity) 
     return duration_min * weighted_intensity
 
@@ -60,28 +68,37 @@ def determine_smart_zone(avg_hr, max_hr_activity, user_max_hr, avg_power, norm_p
     Bestimmt die Zone intelligent. Erkennt Intervalle (niedriger Avg, hoher Max oder hoher VI)
     und stuft diese entsprechend hoch.
     """
-    if not user_max_hr or user_max_hr < 100: return 0, "Z?"
+    if not user_max_hr or user_max_hr < 100 or not avg_hr: return 0, "Z?"
     
     avg_pct = avg_hr / user_max_hr
+    # Fallback: Wenn kein MaxHF der Aktivität da ist, nimm Avg (konservativ)
     max_pct = max_hr_activity / user_max_hr if max_hr_activity else avg_pct
     
+    # Basis-Klassifizierung nach Durchschnitt (Coggan/Friel HR Zones approximiert)
     if avg_pct < 0.60: zone_idx = 0      # Z1 Active Recovery
     elif avg_pct < 0.75: zone_idx = 1    # Z2 Endurance
     elif avg_pct < 0.85: zone_idx = 2    # Z3 Tempo
     elif avg_pct < 0.95: zone_idx = 3    # Z4 Threshold
     else: zone_idx = 4                   # Z5 VO2max
     
+    # 2. Power Variabilitäts-Index (VI) Analyse
+    # VI = Normalized Power / Average Power. 
     vi = 1.0
+    # Sicherstellen, dass wir nicht durch 0 teilen
     if avg_power and avg_power > 10 and norm_power and norm_power > 10:
         vi = norm_power / avg_power
 
+    # -- INTELLIGENTE KORREKTUR --
+    
+    # Fall A: Herzfrequenz Max war sehr hoch (typisch für Intervalle)
     if max_pct > 0.92 and zone_idx < 3:
-        zone_idx = max(zone_idx, 3) 
+        zone_idx = max(zone_idx, 3) # Mindestens Threshold werten
         
+    # Fall B: Power VI ist hoch (typisch für Intervalle/Sprints)
     if vi > 1.15 and zone_idx < 3: 
-        zone_idx = max(zone_idx, 3) 
+        zone_idx = max(zone_idx, 3) # Upgrade auf Z4 (Hard)
     elif vi > 1.08 and zone_idx < 2:
-        zone_idx = max(zone_idx, 2) 
+        zone_idx = max(zone_idx, 2) # Upgrade auf Z3 (Tempo)
 
     labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
     return zone_idx, labels[zone_idx]
@@ -95,9 +112,11 @@ def process_data(raw_activities, user_max_hr):
         act_type = activity.get('activityType', {}).get('typeKey', 'unknown')
         act_name = activity.get('activityName', 'Unbekannt')
         
+        # Filter: Alles was Räder hat
         is_cycling = any(x in act_type.lower() for x in ['cycling', 'biking', 'ride', 'gravel', 'mtb', 'virtual'])
         if not is_cycling: continue
 
+        # Daten sicher extrahieren
         avg_power = robust_get(activity, ['avgPower', 'averagePower', 'normPower'])
         norm_power = robust_get(activity, ['normPower', 'weightedMeanPower', 'normalizedPower'])
         max_20min = robust_get(activity, ['max20MinPower', 'maximum20MinPower', 'twentyMinPower'])
@@ -112,16 +131,38 @@ def process_data(raw_activities, user_max_hr):
         distance_m = robust_get(activity, ['distance']) 
         elevation_m = robust_get(activity, ['totalAscent', 'elevationGain'])
 
-        if avg_hr and duration_min > 5:
+        # --- NEUE STRIKTE FILTERUNG (Update: Threshold 40W) ---
+        # 1. Muss Herzfrequenz haben (>0)
+        has_hr = avg_hr is not None and avg_hr > 0
+        
+        # 2. Muss RELEVANTE Leistung haben (> 40 Watt)
+        # Dies filtert Sensor-Fehler, leere Batterien oder gemütliches Stadtradeln raus.
+        has_power = (avg_power is not None and avg_power > 40) or (norm_power is not None and norm_power > 40)
+        
+        # 3. Muss eine relevante Dauer haben (> 5 Min)
+        has_duration = duration_min > 5
+
+        if has_hr and has_power and has_duration:
+            # Werte bereinigen
             power_val = int(avg_power) if avg_power else None
+            # Fallback: Wenn kein NormPower da ist, nimm AvgPower (ist hier sicher vorhanden wegen Filter)
             norm_power_val = int(norm_power) if norm_power else power_val
+            
             max_20min_val = int(max_20min) if max_20min else 0
             
+            # TRIMP Score berechnen
             stress_score = calculate_trimp(duration_min, avg_hr, user_max_hr)
+            
+            # Smart Zone bestimmen (Mit VI)
             zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, user_max_hr, power_val, norm_power_val)
             
             dist_km = round(distance_m / 1000, 1) if distance_m else 0.0
             elev_m = int(elevation_m) if elevation_m else 0
+            
+            # Efficiency Factor (EF)
+            ef = 0.0
+            if norm_power_val and avg_hr > 40:
+                ef = round(norm_power_val / avg_hr, 2)
             
             try:
                 date_str = activity['startTimeLocal'].split(' ')[0]
@@ -133,7 +174,7 @@ def process_data(raw_activities, user_max_hr):
                 "Datum": date_obj,
                 "Aktivität": act_name,
                 "Leistung": power_val,
-                "NormPower": norm_power_val, 
+                "NormPower": norm_power_val, # Speichern für Fitness-Shift
                 "Max20Min": max_20min_val,
                 "HF": int(avg_hr),
                 "MaxHF": int(max_hr_activity) if max_hr_activity else int(avg_hr),
@@ -143,12 +184,19 @@ def process_data(raw_activities, user_max_hr):
                 "Zone": zone_label,
                 "Kalorien": int(calories) if calories else 0,
                 "Distanz": dist_km,
-                "Anstieg": elev_m
+                "Anstieg": elev_m,
+                "EF": ef
             })
     
     df = pd.DataFrame(data)
+    # Optimierung: Datentypen erzwingen
     if not df.empty:
         df.sort_values('Datum', inplace=True)
+        # Sicherstellen, dass Zahlen auch Zahlen sind (für Altair wichtig)
+        cols_to_numeric = ['Leistung', 'NormPower', 'HF', 'Stress', 'Dauer_Min', 'EF']
+        for col in cols_to_numeric:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
 def generate_demo_data(days=120, user_max_hr=161):
@@ -210,6 +258,10 @@ def generate_demo_data(days=120, user_max_hr=161):
         stress = calculate_trimp(duration, avg_hr, base_hr_max)
         zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, base_hr_max, power, norm_power)
         
+        ef = 0.0
+        if norm_power and avg_hr > 0:
+            ef = round(norm_power / avg_hr, 2)
+
         data.append({
             "Datum": pd.to_datetime(date),
             "Aktivität": f"{ride_type} Training",
@@ -224,7 +276,8 @@ def generate_demo_data(days=120, user_max_hr=161):
             "Zone": zone_label,
             "Kalorien": int(calories),
             "Distanz": round(dist_km, 1),
-            "Anstieg": int(elev_m)
+            "Anstieg": int(elev_m),
+            "EF": ef
         })
     return pd.DataFrame(data)
 
@@ -293,37 +346,60 @@ with st.sidebar:
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
 
-st.title("🚴 Garmin Science Lab V9.6")
+st.title("🚴 Garmin Science Lab V12.4")
 st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
 with st.expander("📘 Wissenschaftlicher Guide: Methodik & Interpretation (Hier klicken)"):
     st.markdown("""
-    ### 🧬 1. Aerobe Entkopplung & Effizienz (Tab: Fitness-Shift)
-    **Die Frage:** "Werde ich fitter oder trete ich nur fester?"
-    * **Prinzip:** Wir korrelieren deine **Normalized Power (NP)** mit der **Herzfrequenz**. NP berücksichtigt die "biologischen Kosten" von Intervallen besser als der reine Durchschnitt.
-    * **Interpretation:**
-        * ✅ **Besser:** Die neue Kurve (Orange) liegt **rechts unterhalb** der alten (Blau). Du trittst mehr Watt bei gleichem Puls.
-        * ⚠️ **Achtung:** Wenn deine Leistung sinkt, die Kurve aber trotzdem "tiefer" liegt, kann das an einer veränderten Steigung liegen (z.B. wenn du in der neuen Phase nur lockere Einheiten gemacht hast und keine Intervalle). Vergleiche immer ähnliche Intensitäten!
-
+    ### 🧬 1. Aerobe Entkopplung & Fitness-Shift
+    
+    **💡 Das Konzept:** Dein Herz ist der Motor, deine Beine das Getriebe. "Fitness" bedeutet, dass dein Motor (Herz) weniger Arbeit leisten muss, um die gleiche Geschwindigkeit (Leistung in Watt) zu erzeugen.
+    
+    **🔍 Die Grafik (Normalized Power vs. HF):**
+    Wir verwenden hier die **Normalized Power (NP)**, nicht den reinen Durchschnitt.
+    * **Warum NP?** Physiologische Kosten sind nicht linear. 300 Watt tun mehr als doppelt so weh wie 150 Watt. NP berücksichtigt, dass Intervalle und Sprints deinen Stoffwechsel exponentiell stärker belasten als gleichmäßiges Fahren.
+    * **Die Interpretation:**
+        * **✅ Gutes Zeichen:** Die Punktewolke deiner aktuellen Trainingsphase (Orange) liegt **rechts unterhalb** der alten Phase (Blau). Du erzeugst mehr metabolischen Output für denselben Input (Herzschlag).
+        * **⚠️ Stagnation:** Die Wolken liegen übereinander.
+    
     ---
 
-    ### ⚖️ 2. Belastungssteuerung via ACWR (Tab: ACWR & Load)
-    **Die Frage:** "Riskiere ich eine Verletzung?"
-    * **Prinzip:** Das *Acute:Chronic Workload Ratio* vergleicht die Last der letzten 7 Tage (Ermüdung) mit der der letzten 28 Tage (Fitness).
-    * **Ampel:**
-        * 🟢 **0.8 - 1.3 (Sweet Spot):** Optimaler Aufbau.
-        * 🔴 **> 1.5 (Danger Zone):** Zu schnelle Steigerung (>50% mehr als gewohnt). Hohes Verletzungsrisiko!
-        * 🔵 **< 0.8 (Detraining):** Formverlust.
-
+    ### ⚖️ 2. Belastungssteuerung (ACWR) - Das "Gewebe-Gedächtnis"
+    
+    **💡 Das Konzept:**
+    Verletzungen passieren oft durch "zu viel zu schnell". Dein Herz-Kreislauf-System passt sich in Wochen an, deine Sehnen und Knochen brauchen Monate. Das ACWR-Modell berücksichtigt diese Trägheit.
+    
+    **🔍 Die Formel (Gabbett-Modell):**
+    * **Acute Load (Ermüdung):** Deine Last der letzten 7 Tage.
+    * **Chronic Load (Fitness/Belastbarkeit):** Was dein Körper in den letzten 28 Tagen gewohnt war.
+    
+    **🚦 Die Zonen:**
+    * 🟢 **0.8 - 1.3 (Sweet Spot):** Ideal. Du forderst deinen Körper etwas mehr als er gewohnt ist, aber nicht so sehr, dass er bricht.
+    * 🔴 **> 1.5 (Danger Zone):** Alarmstufe Rot! Deine aktuelle Last ist 50% höher als deine Gewöhnung. Das Verletzungsrisiko verdoppelt sich hier statistisch.
+    * 🔵 **< 0.8 (Detraining):** Du trainierst weniger als gewohnt und verlierst Form.
+    
     ---
 
-    ### 🎨 3. Zonen-Optimierer (Smart Intervals V2)
-    **Die Frage:** "Trainiere ich effektiv?"
-    * **Smart Detection:** Intervalle haben oft einen niedrigen Durchschnittspuls wegen der Pausen. Dieses Tool prüft daher den **Variabilitäts-Index (VI)** (Verhältnis NP zu Avg Power).
-    * **Logik:** Ist der VI hoch (> 1.15) oder der Max-Puls sehr hoch, klassifiziert das Tool die Einheit korrekt als **Intensiv (Zone 4/5)**, auch wenn der Durchschnittspuls niedrig war.
-    * **Modelle:**
-        * ⏳ **Wenig Zeit (< 5h):** Empfehlung **"Sweet Spot"**. Qualität vor Quantität.
-        * ⏱️ **Viel Zeit (> 10h):** Empfehlung **"Polarized"**. 80% locker (Zone 1/2), 20% hart.
+    ### 📈 3. Effizienz-Faktor (EF) & Trends
+    
+    **💡 Der EF:**
+    `EF = Normalized Power / Durchschnittspuls`.
+    Dies ist die "reine" Metrik für deine aerobe Maschine. Ein EF von 1.5 bedeutet, du erzeugst 1.5 Watt pro Herzschlag.
+    * **Anwendung:** Beobachte diesen Trend bei deinen **Grundlagenfahrten (Zone 2)**. Wenn die Linie über Wochen steigt, hat sich deine mitochondriale Dichte verbessert.
+    
+    ---
+
+    ### 🎨 4. Zonen-Optimierer (Smart Intervals)
+    
+    **💡 Das Problem:** Du fährst harte Intervalle (z.B. 4x4min VO2max), machst aber lange Pausen. Am Ende sagt der Computer: "Durchschnittspuls 135 bpm – das war wohl ein lockeres Training". Das ist falsch.
+    
+    **🔍 Die Lösung (Variabilitäts-Index VI):**
+    Wir berechnen für jede Einheit den *Variabilitäts-Index* (`VI = NP / Avg Power`).
+    * Ein VI von **1.00** bedeutet: Du bist gefahren wie ein Uhrwerk (perfekte Grundlage).
+    * Ein VI über **1.15** bedeutet: Es war ein sehr unruhiges Rennen oder Intervalltraining.
+    
+    **Der Algorithmus dieses Tools:**
+    Erkennt das Tool einen hohen VI oder einen sehr hohen Maximalpuls, stuft es die Einheit automatisch als **Intensiv (Zone 4/5)** ein, selbst wenn der Durchschnittspuls niedrig war.
     """)
 
 # --- Logic ---
@@ -381,7 +457,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
 
     st.divider()
     
-    tab1, tab2, tab3, tab4 = st.tabs(["🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Zonen & Trends", "🎨 Zonen-Optimierer"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer"])
 
     # --- TAB 1 ---
     with tab1:
@@ -442,13 +518,63 @@ if st.session_state.df is not None and not st.session_state.df.empty:
         curr = daily.iloc[-1]['ACWR']
         st.metric("ACWR Status", f"{curr:.2f}", delta="Vorsicht" if curr > 1.5 else "OK", delta_color="inverse")
 
-    # --- TAB 3 ---
+    # --- TAB 3 (TRENDS) ---
     with tab3:
-        daily['Stunden'] = df.set_index('Datum').resample('D')['Dauer_Min'].sum().fillna(0).values / 60
-        base = alt.Chart(daily.reset_index()).encode(x='Datum')
-        bar = base.mark_bar(opacity=0.3, color='purple').encode(y='Stress', tooltip='Stress')
-        line = base.mark_line(color='cyan').encode(y='Stunden', tooltip='Stunden')
-        st.altair_chart(alt.layer(bar, line).resolve_scale(y='independent'), width="stretch")
+        st.subheader("Detail-Analyse: Trends über Zeit")
+        st.write("Wähle die Metriken, die du vergleichen möchtest:")
+        
+        c_sel1, c_sel2, c_sel3, c_sel4 = st.columns(4)
+        show_load = c_sel1.checkbox("Trainingsbelastung", value=True)
+        show_power = c_sel2.checkbox("Leistung (Watt/NP)", value=False)
+        show_hr = c_sel3.checkbox("Herzfrequenz", value=False)
+        show_ef = c_sel4.checkbox("Effizienz (EF)", value=True)
+        
+        daily = df.set_index('Datum').resample('D').agg({
+            'Stress': 'sum', 
+            'Dauer_Min': 'sum',
+            'Leistung': 'mean', 
+            'NormPower': 'mean',
+            'HF': 'mean',
+            'MaxHF': 'max',
+            'EF': 'mean' 
+        }).fillna(0).reset_index()
+        
+        training_days = daily[daily['Dauer_Min'] > 0].copy()
+
+        if show_load:
+            st.markdown("#### 🏋️ Trainingsbelastung")
+            base = alt.Chart(daily).encode(x='Datum')
+            bar = base.mark_bar(opacity=0.3, color='purple').encode(y=alt.Y('Stress', title='Stress Score'), tooltip='Stress')
+            line = base.mark_line(color='cyan').encode(y=alt.Y('Dauer_Min', title='Dauer (Min)'), tooltip='Dauer_Min')
+            st.altair_chart(alt.layer(bar, line).resolve_scale(y='independent'), width="stretch")
+        
+        if show_power:
+            st.markdown("#### ⚡ Leistungsentwicklung (Watt)")
+            power_data = training_days[training_days['NormPower'] > 0]
+            
+            base = alt.Chart(power_data).encode(x='Datum')
+            l1 = base.mark_line(color='orange').encode(y=alt.Y('NormPower', title='Watt'), tooltip='NormPower')
+            l2 = base.mark_line(color='gray', strokeDash=[5,5]).encode(y='Leistung', tooltip='Leistung')
+            st.altair_chart(l1 + l2, width="stretch")
+            st.caption("Orange: Normalized Power (Physiologische Last). Grau: Durchschnitt (Mechanische Last).")
+
+        if show_hr:
+            st.markdown("#### ❤️ Herzfrequenz")
+            base = alt.Chart(training_days).encode(x='Datum')
+            l1 = base.mark_line(color='red').encode(y=alt.Y('MaxHF', scale=alt.Scale(zero=False)), tooltip='MaxHF')
+            l2 = base.mark_line(color='pink').encode(y=alt.Y('HF', scale=alt.Scale(zero=False)), tooltip='HF')
+            st.altair_chart(l1 + l2, width="stretch")
+
+        if show_ef:
+            st.markdown("#### 🚀 Effizienz-Faktor (Watt pro Herzschlag)")
+            ef_data = training_days[training_days['EF'] > 0].copy()
+            ef_data['EF_MA'] = ef_data['EF'].rolling(window=5, min_periods=1).mean()
+            
+            base = alt.Chart(ef_data).encode(x='Datum')
+            points = base.mark_circle(opacity=0.3, color='green').encode(y=alt.Y('EF', scale=alt.Scale(zero=False)), tooltip='EF')
+            line = base.mark_line(color='green', size=3).encode(y='EF_MA', tooltip='EF_MA')
+            st.altair_chart(points + line, width="stretch")
+            st.caption("Verhältnis NP / HF. Steigende Linie = Bessere Fitness.")
 
     # --- TAB 4 ---
     with tab4:
