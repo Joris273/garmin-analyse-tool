@@ -32,65 +32,56 @@ def fetch_garmin_raw(email, password, start_date, end_date):
     try:
         client = Garmin(email, password)
         client.login()
-        # Hole alle Aktivitäten, Filterung erfolgt später
         activities = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat(), "")
         return activities, None
     except Exception as e:
-        # Fehlerbehandlung für Auth-Fehler oder API-Probleme
         return [], str(e)
 
-# --- Helfer: Robuste Datenextraktion ---
+# --- Helfer ---
 def robust_get(activity, keys):
-    """Sucht einen Wert unter verschiedenen Schlüsseln und wandelt ihn sicher in float um."""
     for key in keys:
         val = activity.get(key)
         if val is not None:
             try:
                 float_val = float(val)
-                # Wir akzeptieren auch 0 (z.B. bei Distanz oder Höhe)
                 if float_val >= 0: return float_val 
             except (ValueError, TypeError): 
                 continue
     return None
 
 def calculate_trimp(duration_min, avg_hr, max_hr):
-    """Berechnet TRIMP Score. Fallback, falls max_hr unsinnig ist."""
     if not max_hr or max_hr < 100: max_hr = 190 
     intensity = avg_hr / max_hr
-    # Banister-Formel Gewichtung
     weighted_intensity = intensity * np.exp(1.92 * intensity) 
     return duration_min * weighted_intensity
 
-def determine_smart_zone(avg_hr, max_hr_activity, user_max_hr):
+def determine_smart_zone(avg_hr, max_hr_activity, user_max_hr, avg_power, norm_power):
     """
-    Bestimmt die Zone intelligent. Erkennt Intervalle (niedriger Avg, hoher Max)
+    Bestimmt die Zone intelligent. Erkennt Intervalle (niedriger Avg, hoher Max oder hoher VI)
     und stuft diese entsprechend hoch.
     """
     if not user_max_hr or user_max_hr < 100: return 0, "Z?"
     
     avg_pct = avg_hr / user_max_hr
-    # Fallback: Wenn kein MaxHF der Aktivität da ist, nimm Avg (konservativ)
     max_pct = max_hr_activity / user_max_hr if max_hr_activity else avg_pct
     
-    # Basis-Klassifizierung nach Durchschnitt (Coggan/Friel HR Zones approximiert)
     if avg_pct < 0.60: zone_idx = 0      # Z1 Active Recovery
     elif avg_pct < 0.75: zone_idx = 1    # Z2 Endurance
     elif avg_pct < 0.85: zone_idx = 2    # Z3 Tempo
     elif avg_pct < 0.95: zone_idx = 3    # Z4 Threshold
     else: zone_idx = 4                   # Z5 VO2max
     
-    # SMART INTERVAL DETECTION
-    # Logik: Wenn der Max-Puls sehr hoch war, der Schnitt aber niedrig,
-    # war es wahrscheinlich ein Intervalltraining mit Pausen.
-    # Wir werten das NICHT als reine Grundlage (Z1/Z2), sondern als Belastung.
-    
-    # Fall 1: Max Puls war VO2max (>92%), aber Schnitt suggeriert Tempo oder niedriger
+    vi = 1.0
+    if avg_power and avg_power > 10 and norm_power and norm_power > 10:
+        vi = norm_power / avg_power
+
     if max_pct > 0.92 and zone_idx < 3:
-        zone_idx = 3 # Upgrade auf mindestens Threshold (Z4)
+        zone_idx = max(zone_idx, 3) 
         
-    # Fall 2: Max Puls war Threshold (>88%), aber Schnitt suggeriert Grundlage
-    elif max_pct > 0.88 and zone_idx < 2:
-        zone_idx = 2 # Upgrade auf mindestens Tempo (Z3)
+    if vi > 1.15 and zone_idx < 3: 
+        zone_idx = max(zone_idx, 3) 
+    elif vi > 1.08 and zone_idx < 2:
+        zone_idx = max(zone_idx, 2) 
 
     labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
     return zone_idx, labels[zone_idx]
@@ -104,12 +95,11 @@ def process_data(raw_activities, user_max_hr):
         act_type = activity.get('activityType', {}).get('typeKey', 'unknown')
         act_name = activity.get('activityName', 'Unbekannt')
         
-        # Filter: Alles was Räder hat
         is_cycling = any(x in act_type.lower() for x in ['cycling', 'biking', 'ride', 'gravel', 'mtb', 'virtual'])
         if not is_cycling: continue
 
-        # Daten sicher extrahieren
         avg_power = robust_get(activity, ['avgPower', 'averagePower', 'normPower'])
+        norm_power = robust_get(activity, ['normPower', 'weightedMeanPower', 'normalizedPower'])
         max_20min = robust_get(activity, ['max20MinPower', 'maximum20MinPower', 'twentyMinPower'])
         
         avg_hr = robust_get(activity, ['avgHR', 'averageHR', 'avgHeartRate', 'averageHeartRate'])
@@ -122,32 +112,28 @@ def process_data(raw_activities, user_max_hr):
         distance_m = robust_get(activity, ['distance']) 
         elevation_m = robust_get(activity, ['totalAscent', 'elevationGain'])
 
-        # Validierung: Einheit muss HF haben und > 5 Min sein
         if avg_hr and duration_min > 5:
-            # Werte bereinigen
             power_val = int(avg_power) if avg_power else None
+            norm_power_val = int(norm_power) if norm_power else power_val
             max_20min_val = int(max_20min) if max_20min else 0
             
-            # TRIMP Score berechnen
             stress_score = calculate_trimp(duration_min, avg_hr, user_max_hr)
-            
-            # Smart Zone bestimmen
-            zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, user_max_hr)
+            zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, user_max_hr, power_val, norm_power_val)
             
             dist_km = round(distance_m / 1000, 1) if distance_m else 0.0
             elev_m = int(elevation_m) if elevation_m else 0
             
-            # Sicheres Datum-Parsing
             try:
                 date_str = activity['startTimeLocal'].split(' ')[0]
                 date_obj = pd.to_datetime(date_str)
             except:
-                continue # Überspringe Datensätze mit defektem Datum
+                continue 
 
             data.append({
                 "Datum": date_obj,
                 "Aktivität": act_name,
                 "Leistung": power_val,
+                "NormPower": norm_power_val, 
                 "Max20Min": max_20min_val,
                 "HF": int(avg_hr),
                 "MaxHF": int(max_hr_activity) if max_hr_activity else int(avg_hr),
@@ -165,10 +151,12 @@ def process_data(raw_activities, user_max_hr):
         df.sort_values('Datum', inplace=True)
     return df
 
-def generate_demo_data(days=120):
+def generate_demo_data(days=120, user_max_hr=161):
+    random.seed(42) 
     data = []
     today = datetime.date.today()
-    base_hr_max = 161 
+    base_hr_max = user_max_hr
+    
     for i in range(days):
         if random.random() > 0.6: continue 
         date = today - datetime.timedelta(days=days-i)
@@ -176,10 +164,12 @@ def generate_demo_data(days=120):
         load_factor = 0.5 + (cycle_pos * 0.8) 
         if cycle_pos > 0.8: load_factor = 0.4 
         ride_type = random.choice(['LIT', 'LIT', 'MIT', 'HIT']) 
+        
         duration = 60
         avg_hr = 130
         max_hr_activity = 140
         power = 150 + (i * 0.2)
+        norm_power = power 
         max_20min = power * 1.1 
         calories = 600
         speed = 28 + (random.random() * 5)
@@ -188,39 +178,43 @@ def generate_demo_data(days=120):
 
         if ride_type == 'LIT': 
             duration = random.randint(90, 180) * load_factor
-            avg_hr = 110 + random.randint(-5, 5)
+            avg_hr = int(base_hr_max * 0.65) + random.randint(-5, 5)
             max_hr_activity = avg_hr + random.randint(10, 20)
             power = 160 + (i * 0.1)
+            norm_power = power * 1.02 
             max_20min = power * 1.05 
             calories = duration * 10
             dist_km = (duration/60) * 26
             elev_m = dist_km * 8
         elif ride_type == 'MIT':
             duration = random.randint(60, 90)
-            avg_hr = 135 + random.randint(-5, 5)
+            avg_hr = int(base_hr_max * 0.83) + random.randint(-5, 5)
             max_hr_activity = avg_hr + random.randint(10, 15)
             power = 200 + (i * 0.2)
+            norm_power = power * 1.05
             max_20min = power * 1.1
             calories = duration * 12
             dist_km = (duration/60) * 30
             elev_m = dist_km * 12
         elif ride_type == 'HIT':
             duration = random.randint(45, 70) 
-            avg_hr = 145 + random.randint(-5, 5) 
+            avg_hr = int(base_hr_max * 0.88) + random.randint(-5, 5) 
             max_hr_activity = base_hr_max - random.randint(0, 5) 
             power = 240 + (i * 0.3)
+            norm_power = power * 1.18 
             max_20min = power * 1.2 
             calories = duration * 15
             dist_km = (duration/60) * 32
             elev_m = dist_km * 5
 
         stress = calculate_trimp(duration, avg_hr, base_hr_max)
-        zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, base_hr_max)
+        zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, base_hr_max, power, norm_power)
         
         data.append({
             "Datum": pd.to_datetime(date),
             "Aktivität": f"{ride_type} Training",
             "Leistung": int(power),
+            "NormPower": int(norm_power),
             "Max20Min": int(max_20min),
             "HF": int(avg_hr),
             "MaxHF": int(max_hr_activity),
@@ -246,7 +240,6 @@ with st.sidebar:
         password = st.text_input("Passwort", type="password")
         
         st.markdown("### 1. Zeitraum wählen")
-        
         range_options = {
             "Letzte 30 Tage": 30,
             "Letzte 90 Tage": 90,
@@ -259,7 +252,6 @@ with st.sidebar:
         
         today = datetime.date.today()
         val = range_options[selected_range]
-        
         if val == "cy":
             start_date = datetime.date(today.year, 1, 1)
             end_date = today
@@ -277,25 +269,17 @@ with st.sidebar:
     with tab_params:
         st.subheader("2. Analyse-Fokus")
         st.caption("Wie möchtest du die geladenen Daten vergleichen?")
-        
         user_max_hr = st.number_input("Max Herzfrequenz", 100, 220, 161, help="Beeinflusst Zonen & Stress-Score.")
         
-        # DYNAMISCHE SLIDER-BERECHNUNG (KORRIGIERT)
-        # Standardwert basierend auf Auswahl (falls noch keine Daten da sind)
         days_diff = (end_date - start_date).days
-        
-        # WICHTIG: Wenn wir schon Daten im Speicher haben, orientieren wir uns an DENEN,
-        # nicht an der neuen Auswahl (die noch nicht geladen wurde).
-        # Das verhindert, dass der Slider springt, wenn man nur in der Sidebar klickt.
-        if 'df' in st.session_state and st.session_state.df is not None and not st.session_state.df.empty:
-             min_dt = st.session_state.df['Datum'].min().date()
-             max_dt = st.session_state.df['Datum'].max().date()
-             days_diff = (max_dt - min_dt).days
+        if 'raw_data' in st.session_state and st.session_state.raw_data:
+             if 'df' in st.session_state and st.session_state.df is not None and not st.session_state.df.empty:
+                 min_dt = st.session_state.df['Datum'].min().date()
+                 max_dt = st.session_state.df['Datum'].max().date()
+                 days_diff = (max_dt - min_dt).days
         
         weeks_total = max(1, days_diff // 7)
         max_possible_weeks = max(2, int(weeks_total / 2))
-        
-        # Sicherstellen, dass Standardwert gültig ist
         default_weeks = min(4, max_possible_weeks)
         
         comparison_weeks = st.slider(
@@ -303,67 +287,74 @@ with st.sidebar:
             min_value=1, 
             max_value=max_possible_weeks, 
             value=default_weeks, 
-            help="Bestimmt die Größe der Vergleichsblöcke. Beispiel: Bei '4 Wochen' vergleichen wir die ERSTEN 4 Wochen mit den LETZTEN 4 Wochen deines Zeitraums."
+            help="Bestimmt die Größe der Vergleichsblöcke."
         )
         
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
 
-st.title("🚴 Garmin Science Lab V9.1")
+st.title("🚴 Garmin Science Lab V9.6")
 st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
-with st.expander("📘 Wissenschaftlicher Guide: Anleitung zur Interpretation (Hier klicken)"):
+with st.expander("📘 Wissenschaftlicher Guide: Methodik & Interpretation (Hier klicken)"):
     st.markdown("""
-    Willkommen im Science Lab! Dieses Tool analysiert dein Training nicht nur nach Distanz, sondern nach physiologischer Wirkung.
-    
-    ### 🧬 Tab 1: Fitness-Shift (Aerobe Entkopplung)
+    ### 🧬 1. Aerobe Entkopplung & Effizienz (Tab: Fitness-Shift)
     **Die Frage:** "Werde ich fitter oder trete ich nur fester?"
-    * **Das Prinzip:** Fitness ist definiert als die Fähigkeit, mehr Leistung (Watt) bei gleicher physiologischer Kostenstelle (Herzfrequenz) zu erbringen.
-    * **Das Chart:** Wir vergleichen deine Leistung/Puls-Kurve vom Anfang des Zeitraums (Blau) mit der vom Ende (Orange).
-    * **Dein Ziel:** Die orange Linie sollte **rechts unterhalb** der blauen liegen. Das bedeutet: Für die gleichen 200 Watt schlägt dein Herz heute 5 Schläge langsamer als früher.
-    
+    * **Prinzip:** Wir korrelieren deine **Normalized Power (NP)** mit der **Herzfrequenz**. NP berücksichtigt die "biologischen Kosten" von Intervallen besser als der reine Durchschnitt.
+    * **Interpretation:**
+        * ✅ **Besser:** Die neue Kurve (Orange) liegt **rechts unterhalb** der alten (Blau). Du trittst mehr Watt bei gleichem Puls.
+        * ⚠️ **Achtung:** Wenn deine Leistung sinkt, die Kurve aber trotzdem "tiefer" liegt, kann das an einer veränderten Steigung liegen (z.B. wenn du in der neuen Phase nur lockere Einheiten gemacht hast und keine Intervalle). Vergleiche immer ähnliche Intensitäten!
+
     ---
-    
-    ### ⚖️ Tab 2: ACWR (Verletzungsprävention)
-    **Die Frage:** "Mache ich zu viel zu schnell?"
-    * **Das Prinzip:** Das *Acute:Chronic Workload Ratio* ist der Gold-Standard im Profisport. Es vergleicht deine Ermüdung (Last der letzten 7 Tage) mit deiner Fitness (Last der letzten 28 Tage).
-    * **Die Ampel:**
-        * 🟢 **0.8 - 1.3 (Sweet Spot):** Perfekt. Du baust Fitness auf, ohne dich zu überlasten.
-        * 🔴 **> 1.5 (Danger Zone):** Vorsicht! Du steigerst das Pensum zu abrupt (>50% mehr als gewohnt). Das Verletzungsrisiko steigt exponentiell.
-        * 🔵 **< 0.8 (Detraining):** Du trainierst weniger als gewohnt und verlierst Form.
-    
+
+    ### ⚖️ 2. Belastungssteuerung via ACWR (Tab: ACWR & Load)
+    **Die Frage:** "Riskiere ich eine Verletzung?"
+    * **Prinzip:** Das *Acute:Chronic Workload Ratio* vergleicht die Last der letzten 7 Tage (Ermüdung) mit der der letzten 28 Tage (Fitness).
+    * **Ampel:**
+        * 🟢 **0.8 - 1.3 (Sweet Spot):** Optimaler Aufbau.
+        * 🔴 **> 1.5 (Danger Zone):** Zu schnelle Steigerung (>50% mehr als gewohnt). Hohes Verletzungsrisiko!
+        * 🔵 **< 0.8 (Detraining):** Formverlust.
+
     ---
-    
-    ### 🎨 Tab 4: Zonen-Optimierer (Smart Intervals)
-    **Die Frage:** "Trainiere ich effektiv für meine verfügbare Zeit?"
-    * **Das Problem:** "Viel hilft viel" stimmt nicht immer. Wer wenig Zeit hat, muss anders trainieren als ein Profi.
-    * **Die Modelle:**
-        * **Sweet Spot / Pyramidal (< 5h/Woche):** Wenn du wenig Zeit hast, bringt reines "Locker fahren" kaum Reize. Das Tool empfiehlt hier mehr Intensität (Zone 3/4), um die fehlende Zeit zu kompensieren ("Quality over Quantity").
-        * **Polarized 80/20 (> 10h/Woche):** Wer viel trainiert, muss die lockeren Einheiten extrem diszipliniert (wirklich locker!) fahren, um nicht auszubrennen.
-    * **Smart Interval Detection:** Das Tool erkennt Intervalle automatisch. Wenn dein Durchschnittspuls niedrig war (wegen Pausen), der Max-Puls aber hoch (>92%), wird die Einheit korrekt als "Hart" gewertet und nicht fälschlicherweise als "Grundlage".
+
+    ### 🎨 3. Zonen-Optimierer (Smart Intervals V2)
+    **Die Frage:** "Trainiere ich effektiv?"
+    * **Smart Detection:** Intervalle haben oft einen niedrigen Durchschnittspuls wegen der Pausen. Dieses Tool prüft daher den **Variabilitäts-Index (VI)** (Verhältnis NP zu Avg Power).
+    * **Logik:** Ist der VI hoch (> 1.15) oder der Max-Puls sehr hoch, klassifiziert das Tool die Einheit korrekt als **Intensiv (Zone 4/5)**, auch wenn der Durchschnittspuls niedrig war.
+    * **Modelle:**
+        * ⏳ **Wenig Zeit (< 5h):** Empfehlung **"Sweet Spot"**. Qualität vor Quantität.
+        * ⏱️ **Viel Zeit (> 10h):** Empfehlung **"Polarized"**. 80% locker (Zone 1/2), 20% hart.
     """)
 
 # --- Logic ---
 if 'df' not in st.session_state: st.session_state.df = None
+if 'raw_data' not in st.session_state: st.session_state.raw_data = None
+if 'mode' not in st.session_state: st.session_state.mode = None 
 
 if start_btn and email and password:
-    with st.spinner("Lade Daten..."):
+    with st.spinner("Lade Daten von Garmin..."):
         raw, err = fetch_garmin_raw(email, password, start_date, end_date)
-        if err: st.error(err)
+        if err: 
+            st.error(err)
         else:
-            processed = process_data(raw, user_max_hr)
-            if not processed.empty:
-                st.session_state.df = processed
-                st.success(f"{len(processed)} Aktivitäten geladen.")
-            else: st.warning("Keine Rad-Daten gefunden.")
+            st.session_state.raw_data = raw
+            st.session_state.mode = 'real'
+            st.success(f"{len(raw)} Aktivitäten geladen.")
+
 elif demo_btn:
-    st.session_state.df = generate_demo_data(days=90)
+    st.session_state.raw_data = None 
+    st.session_state.mode = 'demo'
+
+if st.session_state.mode == 'real' and st.session_state.raw_data:
+    st.session_state.df = process_data(st.session_state.raw_data, user_max_hr)
+
+elif st.session_state.mode == 'demo':
+    st.session_state.df = generate_demo_data(days=90, user_max_hr=user_max_hr)
 
 # --- DASHBOARD ---
-if st.session_state.df is not None:
+if st.session_state.df is not None and not st.session_state.df.empty:
     df = st.session_state.df.copy()
     
-    # Highscores (Dynamisch)
     st.markdown(f"### 🏆 Bestwerte (Im gesamten Zeitraum)")
     m1, m2, m3, m4 = st.columns(4)
     
@@ -395,7 +386,7 @@ if st.session_state.df is not None:
     # --- TAB 1 ---
     with tab1:
         st.caption(f"Vergleich: Erste {comparison_weeks} Wochen vs. Letzte {comparison_weeks} Wochen deiner Daten.")
-        df_power = df.dropna(subset=['Leistung']).copy()
+        df_power = df.dropna(subset=['NormPower']).copy()
         
         if not df_power.empty:
             min_d, max_d = df_power['Datum'].min(), df_power['Datum'].max()
@@ -406,12 +397,12 @@ if st.session_state.df is not None:
             df_compare = df_power[df_power['Phase'] != "Mitte"]
 
             chart = alt.Chart(df_compare).mark_circle(size=80).encode(
-                x=alt.X('Leistung', title='Leistung (Watt)', scale=alt.Scale(zero=False)),
+                x=alt.X('NormPower', title='Normalized Power (Watt)', scale=alt.Scale(zero=False)),
                 y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
                 color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
-                tooltip=['Datum', 'Aktivität', 'Leistung', 'HF']
+                tooltip=['Datum', 'Aktivität', 'NormPower', 'HF']
             )
-            lines = chart.transform_regression('Leistung', 'HF', groupby=['Phase']).mark_line(size=3)
+            lines = chart.transform_regression('NormPower', 'HF', groupby=['Phase']).mark_line(size=3)
             st.altair_chart(chart + lines, width="stretch")
             
             c1, c2 = st.columns(2)
@@ -422,20 +413,18 @@ if st.session_state.df is not None:
                 recent = df_zone[df_zone['Datum'] >= split_late]
                 old = df_zone[df_zone['Datum'] <= split_early]
                 if not recent.empty and not old.empty:
-                    diff = int(recent['Leistung'].mean() - old['Leistung'].mean())
-                    c2.metric(f"Leistung bei {target_hr} bpm", f"{int(recent['Leistung'].mean())} W", f"{diff} W")
+                    diff = int(recent['NormPower'].mean() - old['NormPower'].mean())
+                    c2.metric(f"NP bei {target_hr} bpm", f"{int(recent['NormPower'].mean())} W", f"{diff} W")
                 else: c2.warning("Zu wenig Daten in den Phasen.")
             else: c2.info("Keine Fahrten im gewählten Pulsbereich.")
         else: st.warning("Keine Leistungsdaten.")
 
     # --- TAB 2 ---
     with tab2:
-        # Resampling und ACWR Berechnung (Robust gegen Nullen)
         daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
         daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
         daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
         
-        # Vermeidung von Division durch Null oder Inf
         daily['ACWR'] = daily['Acute'] / daily['Chronic']
         daily['ACWR'] = daily['ACWR'].replace([np.inf, -np.inf], 0).fillna(0)
         
@@ -521,5 +510,5 @@ if st.session_state.df is not None:
         else:
             st.warning(f"Keine Trainingsdaten in den letzten {comparison_weeks} Wochen gefunden.")
 
-else:
+elif st.session_state.df is None and not start_btn and not demo_btn:
     st.info("👈 Bitte links starten.")
