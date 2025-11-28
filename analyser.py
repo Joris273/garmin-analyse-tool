@@ -44,7 +44,7 @@ def robust_get(activity, keys):
         if val is not None:
             try:
                 float_val = float(val)
-                if float_val > 0: return float_val
+                if float_val >= 0: return float_val # Auch 0 akzeptieren
             except: continue
     return None
 
@@ -54,18 +54,36 @@ def calculate_trimp(duration_min, avg_hr, max_hr):
     weighted_intensity = intensity * np.exp(1.92 * intensity) 
     return duration_min * weighted_intensity
 
-def get_hr_zone_key(avg_hr, max_hr):
-    if not max_hr: return 0
-    pct = avg_hr / max_hr
-    if pct < 0.60: return 0 # Z1
-    elif pct < 0.70: return 1 # Z2
-    elif pct < 0.80: return 2 # Z3
-    elif pct < 0.90: return 3 # Z4
-    else: return 4 # Z5
+def determine_smart_zone(avg_hr, max_hr_activity, user_max_hr):
+    """
+    Bestimmt die Zone intelligent. Erkennt Intervalle (niedriger Avg, hoher Max)
+    und stuft diese entsprechend hoch, damit sie nicht als "Grundlage" verfälscht werden.
+    """
+    if not user_max_hr or user_max_hr < 100: return 0, "Z?"
+    
+    avg_pct = avg_hr / user_max_hr
+    max_pct = max_hr_activity / user_max_hr if max_hr_activity else avg_pct
+    
+    # Standard Zonen (nach Coggan/Friel grob angenähert für HR)
+    # 0=Z1, 1=Z2, 2=Z3, 3=Z4, 4=Z5
+    
+    # Basis-Klassifizierung nach Durchschnitt
+    if avg_pct < 0.60: zone_idx = 0
+    elif avg_pct < 0.75: zone_idx = 1 # Z2 geht oft bis 75% HFmax
+    elif avg_pct < 0.85: zone_idx = 2
+    elif avg_pct < 0.95: zone_idx = 3
+    else: zone_idx = 4
+    
+    # INTELLIGENTE KORREKTUR FÜR INTERVALLE
+    # Wenn der Max-Puls tief in Zone 5 (>92%) war, aber der Schnitt nur Z2/Z3,
+    # war es wahrscheinlich ein hartes Intervall-Training.
+    if max_pct > 0.92 and zone_idx < 3:
+        zone_idx = 3 # Upgrade auf mindestens "Threshold/Hard" (Z4)
+    elif max_pct > 0.88 and zone_idx < 2:
+        zone_idx = 2 # Upgrade auf mindestens "Tempo" (Z3)
 
-def get_zone_label(zone_idx):
     labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
-    return labels[zone_idx]
+    return zone_idx, labels[zone_idx]
 
 # --- Datenverarbeitung ---
 def process_data(raw_activities, user_max_hr):
@@ -81,16 +99,26 @@ def process_data(raw_activities, user_max_hr):
 
         avg_power = robust_get(activity, ['avgPower', 'averagePower', 'normPower'])
         max_20min = robust_get(activity, ['max20MinPower', 'maximum20MinPower', 'twentyMinPower'])
+        
         avg_hr = robust_get(activity, ['avgHR', 'averageHR', 'avgHeartRate', 'averageHeartRate'])
+        max_hr_activity = robust_get(activity, ['maxHR', 'maxHeartRate', 'maximumHeartRate'])
+        
         duration = round(activity.get('duration', 0) / 60, 1)
         calories = robust_get(activity, ['calories', 'totalCalories'])
+        
+        distance = robust_get(activity, ['distance']) 
+        elevation = robust_get(activity, ['totalAscent', 'elevationGain'])
 
         if avg_hr and duration > 5:
             power_val = int(avg_power) if avg_power else None
             max_20min_val = int(max_20min) if max_20min else 0
             stress_score = calculate_trimp(duration, avg_hr, user_max_hr)
-            zone_idx = get_hr_zone_key(avg_hr, user_max_hr)
-            zone_label = get_zone_label(zone_idx)
+            
+            # Nutzung der neuen Smart-Zone Funktion
+            zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, user_max_hr)
+            
+            dist_km = round(distance / 1000, 1) if distance else 0.0
+            elev_m = int(elevation) if elevation else 0
 
             data.append({
                 "Datum": pd.to_datetime(activity['startTimeLocal'].split(' ')[0]),
@@ -98,11 +126,14 @@ def process_data(raw_activities, user_max_hr):
                 "Leistung": power_val,
                 "Max20Min": max_20min_val,
                 "HF": int(avg_hr),
+                "MaxHF": int(max_hr_activity) if max_hr_activity else int(avg_hr),
                 "Dauer_Min": duration,
                 "Stress": round(stress_score, 1),
                 "ZoneIdx": zone_idx,
                 "Zone": zone_label,
-                "Kalorien": int(calories) if calories else 0
+                "Kalorien": int(calories) if calories else 0,
+                "Distanz": dist_km,
+                "Anstieg": elev_m
             })
     
     df = pd.DataFrame(data)
@@ -121,43 +152,63 @@ def generate_demo_data(days=120):
         load_factor = 0.5 + (cycle_pos * 0.8) 
         if cycle_pos > 0.8: load_factor = 0.4 
         ride_type = random.choice(['LIT', 'LIT', 'MIT', 'HIT']) 
+        
         duration = 60
         avg_hr = 130
+        max_hr_activity = 140
         power = 150 + (i * 0.2)
         max_20min = power * 1.1 
         calories = 600
+        
+        speed = 28 + (random.random() * 5)
+        dist_km = (duration/60) * speed
+        elev_m = dist_km * random.randint(5, 15)
+
         if ride_type == 'LIT': 
             duration = random.randint(90, 180) * load_factor
             avg_hr = 110 + random.randint(-5, 5)
+            max_hr_activity = avg_hr + random.randint(10, 20)
             power = 160 + (i * 0.1)
             max_20min = power * 1.05 
             calories = duration * 10
+            dist_km = (duration/60) * 26
+            elev_m = dist_km * 8
         elif ride_type == 'MIT':
             duration = random.randint(60, 90)
             avg_hr = 135 + random.randint(-5, 5)
+            max_hr_activity = avg_hr + random.randint(10, 15)
             power = 200 + (i * 0.2)
             max_20min = power * 1.1
             calories = duration * 12
+            dist_km = (duration/60) * 30
+            elev_m = dist_km * 12
         elif ride_type == 'HIT':
             duration = random.randint(45, 70) 
-            avg_hr = 150 + random.randint(-5, 5)
+            avg_hr = 145 + random.randint(-5, 5) # Schnitt oft nur Z3/Z4
+            max_hr_activity = base_hr_max - random.randint(0, 5) # Aber Max ist Z5!
             power = 240 + (i * 0.3)
             max_20min = power * 1.2 
             calories = duration * 15
+            dist_km = (duration/60) * 32
+            elev_m = dist_km * 5
+
         stress = calculate_trimp(duration, avg_hr, base_hr_max)
-        zone_idx = get_hr_zone_key(avg_hr, base_hr_max)
-        zone_label = get_zone_label(zone_idx)
+        zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, base_hr_max)
+        
         data.append({
             "Datum": pd.to_datetime(date),
             "Aktivität": f"{ride_type} Training",
             "Leistung": int(power),
             "Max20Min": int(max_20min),
             "HF": int(avg_hr),
+            "MaxHF": int(max_hr_activity),
             "Dauer_Min": int(duration),
             "Stress": round(stress, 1),
             "ZoneIdx": zone_idx,
             "Zone": zone_label,
-            "Kalorien": int(calories)
+            "Kalorien": int(calories),
+            "Distanz": round(dist_km, 1),
+            "Anstieg": int(elev_m)
         })
     return pd.DataFrame(data)
 
@@ -167,17 +218,13 @@ with st.sidebar:
     st.header("⚙️ Setup")
     tab_login, tab_params = st.tabs(["Login", "Parameter"])
     with tab_login:
-        # Hinweisbox VOR den Inputs für maximales Vertrauen
         st.info("🔒 **Datenschutz:** Deine Zugangsdaten werden **nur** für die Verbindung zu Garmin genutzt und **nicht gespeichert**. Alles läuft sicher im Arbeitsspeicher.")
-        
         email = st.text_input("Garmin E-Mail")
         password = st.text_input("Passwort", type="password")
         today = datetime.date.today()
         default_start = today - datetime.timedelta(days=120)
         date_range = st.date_input("Zeitraum", [default_start, today])
-        
         st.caption("ℹ️ Daten werden temporär (60min) gecached, damit du schneller analysieren kannst.")
-        
         col1, col2 = st.columns(2)
         start_btn = col1.button("Start", type="primary")
         demo_btn = col2.button("Demo")
@@ -189,7 +236,7 @@ with st.sidebar:
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
 
-st.title("🚴 Garmin Science Lab V6.3")
+st.title("🚴 Garmin Science Lab V7 (Smart Intervals)")
 st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
 with st.expander("📘 Wissenschaftlicher Guide: Warum diese Metriken?"):
@@ -198,9 +245,9 @@ with st.expander("📘 Wissenschaftlicher Guide: Warum diese Metriken?"):
     * **Ziel:** Bei gleichem Puls mehr Watt treten. Die orange Kurve sollte rechts unterhalb der blauen liegen.
     ### 2. ACWR (Verletzungsprävention)
     * **Ziel:** Sweet Spot (0.8 - 1.3). Vermeide Spitzen über 1.5 ("Danger Zone"), um Verletzungen vorzubeugen.
-    ### 3. Intensitäts-Verteilung (Modelle)
-    * **Wenig Zeit (< 5h):** "Sweet Spot". Qualität statt Quantität.
-    * **Viel Zeit (> 10h):** "Polarized". 80% locker, 20% hart.
+    ### 3. Intensitäts-Verteilung (Smart Intervals)
+    * **Problem:** Intervalle haben oft einen niedrigen Durchschnittspuls wegen der Pausen.
+    * **Lösung:** Diese App erkennt, wenn dein Max-Puls hoch war (z.B. >92%), der Schnitt aber niedrig, und wertet das Training korrekt als **Intensiv** (Zone 4/5), damit deine Bilanz stimmt.
     """)
 
 # --- Logic ---
@@ -223,9 +270,11 @@ elif demo_btn:
 if st.session_state.df is not None:
     df = st.session_state.df.copy()
     
-    # Highscores
-    st.markdown("### 🏆 Bestwerte (Zeitraum)")
+    # Highscores (Dynamisch)
+    st.markdown("### 🏆 Bestwerte (Gewählter Zeitraum)")
     m1, m2, m3, m4 = st.columns(4)
+    
+    # 1. Power
     if 'Max20Min' in df and df['Max20Min'].max() > 0:
         best = df.loc[df['Max20Min'].idxmax()]
         m1.metric("Beste 20min Power", f"{int(best['Max20Min'])} W", best['Datum'].strftime('%d.%m.'))
@@ -233,12 +282,22 @@ if st.session_state.df is not None:
         best = df.loc[df['Leistung'].idxmax()]
         m1.metric("Beste Ø Watt", f"{int(best['Leistung'])} W", "N/A")
     
-    if 'Stress' in df and df['Stress'].max() > 0:
-        hardest = df.loc[df['Stress'].idxmax()]
-        m2.metric("Härtestes Training", f"{int(hardest['Stress'])} Score", hardest['Datum'].strftime('%d.%m.'))
+    # 2. Königsetappe / Weiteste Fahrt
+    # Priorisiere Höhenmeter, wenn vorhanden (> 300hm in einer Fahrt), sonst Distanz
+    max_elev = df['Anstieg'].max()
+    if max_elev > 300:
+        king_stage = df.loc[df['Anstieg'].idxmax()]
+        m2.metric("Königsetappe", f"{int(king_stage['Anstieg'])} hm", f"{king_stage['Distanz']} km ({king_stage['Datum'].strftime('%d.%m.')})")
+    else:
+        longest = df.loc[df['Distanz'].idxmax()]
+        m2.metric("Weiteste Fahrt", f"{longest['Distanz']} km", longest['Datum'].strftime('%d.%m.'))
     
-    total_km = int(df['Dauer_Min'].sum() * 0.5)
-    m3.metric("Gesamtzeit", f"{int(df['Dauer_Min'].sum() / 60)}h", f"~{total_km} km")
+    # 3. Total Stats (Real Data)
+    total_km = int(df['Distanz'].sum())
+    total_hours = int(df['Dauer_Min'].sum() / 60)
+    m3.metric("Gesamtleistung", f"{total_km} km", f"{total_hours} Stunden")
+    
+    # 4. Calories
     m4.metric("Kalorien Total", f"{int(df['Kalorien'].sum()):,} kcal".replace(",", "."))
 
     st.divider()
@@ -248,7 +307,6 @@ if st.session_state.df is not None:
     # --- TAB 1 ---
     with tab1:
         st.caption(f"Vergleich Start ({comparison_weeks} Wo.) vs. Ende ({comparison_weeks} Wo.).")
-        # FIX: .copy() hinzugefügt
         df_power = df.dropna(subset=['Leistung']).copy()
         
         if not df_power.empty:
@@ -263,7 +321,7 @@ if st.session_state.df is not None:
                 x=alt.X('Leistung', title='Leistung (Watt)', scale=alt.Scale(zero=False)),
                 y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
                 color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
-                tooltip=['Datum', 'Aktivität', 'Leistung', 'HF']
+                tooltip=['Datum', 'Aktivität', 'Leistung', 'HF', 'MaxHF']
             )
             lines = chart.transform_regression('Leistung', 'HF', groupby=['Phase']).mark_line(size=3)
             st.altair_chart(chart + lines, width="stretch")
@@ -312,53 +370,63 @@ if st.session_state.df is not None:
 
     # --- TAB 4 ---
     with tab4:
-        min_d, max_d = df['Datum'].min(), df['Datum'].max()
-        weeks = max(1, (max_d - min_d).days / 7)
-        vol = (df['Dauer_Min'].sum() / 60) / weeks
+        st.subheader(f"Intensitäts-Verteilung: Letzte {comparison_weeks} Wochen")
         
-        if vol < 5.5:
-            mod, targets = "Sweet Spot / Pyramidal", [10, 40, 30, 15, 5]
-            msg = "Wenig Zeit (<5.5h) braucht Qualität (Zone 3/4)."
-        elif vol < 10:
-            mod, targets = "Hybrid", [15, 60, 15, 7, 3]
-            msg = "Mittleres Volumen. Solide Basis, moderate Intensität."
-        else:
-            mod, targets = "Polarized (80/20)", [25, 55, 5, 10, 5]
-            msg = "Hohes Volumen. Vermeide die graue Zone 3!"
+        max_date_in_data = df['Datum'].max()
+        start_analysis = max_date_in_data - datetime.timedelta(weeks=comparison_weeks)
+        df_recent = df[df['Datum'] >= start_analysis].copy()
+        
+        if not df_recent.empty:
+            vol_total = df_recent['Dauer_Min'].sum() / 60
+            vol_avg = vol_total / comparison_weeks 
+            
+            if vol_avg < 5.5:
+                mod, targets = "Sweet Spot / Pyramidal", [10, 40, 30, 15, 5]
+                msg = f"Wenig Zeit ({vol_avg:.1f}h) im aktuellen Fenster."
+            elif vol_avg < 10:
+                mod, targets = "Hybrid", [15, 60, 15, 7, 3]
+                msg = f"Mittleres Volumen ({vol_avg:.1f}h)."
+            else:
+                mod, targets = "Polarized (80/20)", [25, 55, 5, 10, 5]
+                msg = f"Hohes Volumen ({vol_avg:.1f}h)."
 
-        c1, c2 = st.columns(2)
-        c1.metric("Ø Volumen", f"{vol:.1f} h/Woche")
-        c2.metric("Modell", mod)
-        st.info(msg)
-        
-        counts = df['ZoneIdx'].value_counts().sort_index()
-        total = len(df)
-        labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
-        
-        cols = st.columns(5)
-        comp_data = []
-        for i in range(5):
-            act_pct = (counts.get(i, 0) / total * 100) if total > 0 else 0
-            delta = act_pct - targets[i]
+            c1, c2 = st.columns(2)
+            c1.metric(f"Ø Volumen (Letzte {comparison_weeks} Wo.)", f"{vol_avg:.1f} h/Woche")
+            c2.metric("Empfohlenes Modell", mod)
+            st.info(msg)
             
-            with cols[i]:
-                st.markdown(f"**{labels[i]}**")
-                st.progress(min(act_pct/100, 1.0))
-                st.metric("Anteil", f"{int(act_pct)}%", f"{int(delta)}% vs Ziel", delta_color="inverse")
+            counts = df_recent['ZoneIdx'].value_counts().sort_index()
+            total = len(df_recent)
+            labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
             
-            comp_data.extend([
-                {"Zone": labels[i], "Typ": "Ist", "Prozent": act_pct},
-                {"Zone": labels[i], "Typ": "Soll", "Prozent": targets[i]}
-            ])
+            st.divider()
+            cols = st.columns(5)
+            comp_data = []
             
-        chart = alt.Chart(pd.DataFrame(comp_data)).mark_bar().encode(
-            x=alt.X('Zone', sort=labels),
-            y='Prozent',
-            color='Typ',
-            xOffset='Typ',
-            tooltip=['Zone', 'Typ', alt.Tooltip('Prozent', format='.1f')]
-        )
-        st.altair_chart(chart, width="stretch")
+            for i in range(5):
+                act_pct = (counts.get(i, 0) / total * 100) if total > 0 else 0
+                delta = act_pct - targets[i]
+                
+                with cols[i]:
+                    st.markdown(f"**{labels[i]}**")
+                    st.progress(min(act_pct/100, 1.0))
+                    st.metric("Anteil", f"{int(act_pct)}%", f"{int(delta)}% vs Ziel", delta_color="inverse")
+                
+                comp_data.extend([
+                    {"Zone": labels[i], "Typ": "Ist", "Prozent": act_pct},
+                    {"Zone": labels[i], "Typ": "Soll", "Prozent": targets[i]}
+                ])
+                
+            chart = alt.Chart(pd.DataFrame(comp_data)).mark_bar().encode(
+                x=alt.X('Zone', sort=labels),
+                y='Prozent',
+                color='Typ',
+                xOffset='Typ',
+                tooltip=['Zone', 'Typ', alt.Tooltip('Prozent', format='.1f')]
+            )
+            st.altair_chart(chart, width="stretch")
+        else:
+            st.warning(f"Keine Trainingsdaten in den letzten {comparison_weeks} Wochen gefunden.")
 
 else:
     st.info("👈 Bitte links starten.")
