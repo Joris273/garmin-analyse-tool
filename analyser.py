@@ -44,7 +44,7 @@ def robust_get(activity, keys):
         if val is not None:
             try:
                 float_val = float(val)
-                if float_val >= 0: return float_val # Auch 0 akzeptieren
+                if float_val >= 0: return float_val 
             except: continue
     return None
 
@@ -65,18 +65,13 @@ def determine_smart_zone(avg_hr, max_hr_activity, user_max_hr):
     max_pct = max_hr_activity / user_max_hr if max_hr_activity else avg_pct
     
     # Standard Zonen (nach Coggan/Friel grob angenähert für HR)
-    # 0=Z1, 1=Z2, 2=Z3, 3=Z4, 4=Z5
-    
-    # Basis-Klassifizierung nach Durchschnitt
     if avg_pct < 0.60: zone_idx = 0
-    elif avg_pct < 0.75: zone_idx = 1 # Z2 geht oft bis 75% HFmax
+    elif avg_pct < 0.75: zone_idx = 1 
     elif avg_pct < 0.85: zone_idx = 2
     elif avg_pct < 0.95: zone_idx = 3
     else: zone_idx = 4
     
     # INTELLIGENTE KORREKTUR FÜR INTERVALLE
-    # Wenn der Max-Puls tief in Zone 5 (>92%) war, aber der Schnitt nur Z2/Z3,
-    # war es wahrscheinlich ein hartes Intervall-Training.
     if max_pct > 0.92 and zone_idx < 3:
         zone_idx = 3 # Upgrade auf mindestens "Threshold/Hard" (Z4)
     elif max_pct > 0.88 and zone_idx < 2:
@@ -114,7 +109,6 @@ def process_data(raw_activities, user_max_hr):
             max_20min_val = int(max_20min) if max_20min else 0
             stress_score = calculate_trimp(duration, avg_hr, user_max_hr)
             
-            # Nutzung der neuen Smart-Zone Funktion
             zone_idx, zone_label = determine_smart_zone(avg_hr, max_hr_activity, user_max_hr)
             
             dist_km = round(distance / 1000, 1) if distance else 0.0
@@ -152,14 +146,12 @@ def generate_demo_data(days=120):
         load_factor = 0.5 + (cycle_pos * 0.8) 
         if cycle_pos > 0.8: load_factor = 0.4 
         ride_type = random.choice(['LIT', 'LIT', 'MIT', 'HIT']) 
-        
         duration = 60
         avg_hr = 130
         max_hr_activity = 140
         power = 150 + (i * 0.2)
         max_20min = power * 1.1 
         calories = 600
-        
         speed = 28 + (random.random() * 5)
         dist_km = (duration/60) * speed
         elev_m = dist_km * random.randint(5, 15)
@@ -184,8 +176,8 @@ def generate_demo_data(days=120):
             elev_m = dist_km * 12
         elif ride_type == 'HIT':
             duration = random.randint(45, 70) 
-            avg_hr = 145 + random.randint(-5, 5) # Schnitt oft nur Z3/Z4
-            max_hr_activity = base_hr_max - random.randint(0, 5) # Aber Max ist Z5!
+            avg_hr = 145 + random.randint(-5, 5) 
+            max_hr_activity = base_hr_max - random.randint(0, 5) 
             power = 240 + (i * 0.3)
             max_20min = power * 1.2 
             calories = duration * 15
@@ -236,18 +228,38 @@ with st.sidebar:
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
 
-st.title("🚴 Garmin Science Lab V7 (Smart Intervals)")
+st.title("🚴 Garmin Science Lab V7.4")
 st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
-with st.expander("📘 Wissenschaftlicher Guide: Warum diese Metriken?"):
+with st.expander("📘 Wissenschaftlicher Guide: Anleitung zur Interpretation (Hier klicken)"):
     st.markdown("""
-    ### 1. Aerobe Effizienz (Entkopplung)
-    * **Ziel:** Bei gleichem Puls mehr Watt treten. Die orange Kurve sollte rechts unterhalb der blauen liegen.
-    ### 2. ACWR (Verletzungsprävention)
-    * **Ziel:** Sweet Spot (0.8 - 1.3). Vermeide Spitzen über 1.5 ("Danger Zone"), um Verletzungen vorzubeugen.
-    ### 3. Intensitäts-Verteilung (Smart Intervals)
-    * **Problem:** Intervalle haben oft einen niedrigen Durchschnittspuls wegen der Pausen.
-    * **Lösung:** Diese App erkennt, wenn dein Max-Puls hoch war (z.B. >92%), der Schnitt aber niedrig, und wertet das Training korrekt als **Intensiv** (Zone 4/5), damit deine Bilanz stimmt.
+    Willkommen im Science Lab! Dieses Tool analysiert dein Training nicht nur nach Distanz, sondern nach physiologischer Wirkung.
+    
+    ### 🧬 Tab 1: Fitness-Shift (Aerobe Entkopplung)
+    **Die Frage:** "Werde ich fitter oder trete ich nur fester?"
+    * **Das Prinzip:** Fitness ist definiert als die Fähigkeit, mehr Leistung (Watt) bei gleicher physiologischer Kostenstelle (Herzfrequenz) zu erbringen.
+    * **Das Chart:** Wir vergleichen deine Leistung/Puls-Kurve vom Anfang des Zeitraums (Blau) mit der vom Ende (Orange).
+    * **Dein Ziel:** Die orange Linie sollte **rechts unterhalb** der blauen liegen. Das bedeutet: Für die gleichen 200 Watt schlägt dein Herz heute 5 Schläge langsamer als früher.
+    
+    ---
+    
+    ### ⚖️ Tab 2: ACWR (Verletzungsprävention)
+    **Die Frage:** "Mache ich zu viel zu schnell?"
+    * **Das Prinzip:** Das *Acute:Chronic Workload Ratio* ist der Gold-Standard im Profisport. Es vergleicht deine Ermüdung (Last der letzten 7 Tage) mit deiner Fitness (Last der letzten 28 Tage).
+    * **Die Ampel:**
+        * 🟢 **0.8 - 1.3 (Sweet Spot):** Perfekt. Du baust Fitness auf, ohne dich zu überlasten.
+        * 🔴 **> 1.5 (Danger Zone):** Vorsicht! Du steigerst das Pensum zu abrupt (>50% mehr als gewohnt). Das Verletzungsrisiko steigt exponentiell.
+        * 🔵 **< 0.8 (Detraining):** Du trainierst weniger als gewohnt und verlierst Form.
+    
+    ---
+    
+    ### 🎨 Tab 4: Zonen-Optimierer (Smart Intervals)
+    **Die Frage:** "Trainiere ich effektiv für meine verfügbare Zeit?"
+    * **Das Problem:** "Viel hilft viel" stimmt nicht immer. Wer wenig Zeit hat, muss anders trainieren als ein Profi.
+    * **Die Modelle:**
+        * **Sweet Spot / Pyramidal (< 5h/Woche):** Wenn du wenig Zeit hast, bringt reines "Locker fahren" kaum Reize. Das Tool empfiehlt hier mehr Intensität (Zone 3/4), um die fehlende Zeit zu kompensieren ("Quality over Quantity").
+        * **Polarized 80/20 (> 10h/Woche):** Wer viel trainiert, muss die lockeren Einheiten extrem diszipliniert (wirklich locker!) fahren, um nicht auszubrennen.
+    * **Smart Interval Detection:** Das Tool erkennt Intervalle automatisch. Wenn dein Durchschnittspuls niedrig war (wegen Pausen), der Max-Puls aber hoch (>92%), wird die Einheit korrekt als "Hart" gewertet und nicht fälschlicherweise als "Grundlage".
     """)
 
 # --- Logic ---
@@ -270,11 +282,10 @@ elif demo_btn:
 if st.session_state.df is not None:
     df = st.session_state.df.copy()
     
-    # Highscores (Dynamisch)
+    # Highscores
     st.markdown("### 🏆 Bestwerte (Gewählter Zeitraum)")
     m1, m2, m3, m4 = st.columns(4)
     
-    # 1. Power
     if 'Max20Min' in df and df['Max20Min'].max() > 0:
         best = df.loc[df['Max20Min'].idxmax()]
         m1.metric("Beste 20min Power", f"{int(best['Max20Min'])} W", best['Datum'].strftime('%d.%m.'))
@@ -282,8 +293,6 @@ if st.session_state.df is not None:
         best = df.loc[df['Leistung'].idxmax()]
         m1.metric("Beste Ø Watt", f"{int(best['Leistung'])} W", "N/A")
     
-    # 2. Königsetappe / Weiteste Fahrt
-    # Priorisiere Höhenmeter, wenn vorhanden (> 300hm in einer Fahrt), sonst Distanz
     max_elev = df['Anstieg'].max()
     if max_elev > 300:
         king_stage = df.loc[df['Anstieg'].idxmax()]
@@ -292,12 +301,10 @@ if st.session_state.df is not None:
         longest = df.loc[df['Distanz'].idxmax()]
         m2.metric("Weiteste Fahrt", f"{longest['Distanz']} km", longest['Datum'].strftime('%d.%m.'))
     
-    # 3. Total Stats (Real Data)
     total_km = int(df['Distanz'].sum())
     total_hours = int(df['Dauer_Min'].sum() / 60)
     m3.metric("Gesamtleistung", f"{total_km} km", f"{total_hours} Stunden")
     
-    # 4. Calories
     m4.metric("Kalorien Total", f"{int(df['Kalorien'].sum()):,} kcal".replace(",", "."))
 
     st.divider()
@@ -321,7 +328,7 @@ if st.session_state.df is not None:
                 x=alt.X('Leistung', title='Leistung (Watt)', scale=alt.Scale(zero=False)),
                 y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
                 color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
-                tooltip=['Datum', 'Aktivität', 'Leistung', 'HF', 'MaxHF']
+                tooltip=['Datum', 'Aktivität', 'Leistung', 'HF']
             )
             lines = chart.transform_regression('Leistung', 'HF', groupby=['Phase']).mark_line(size=3)
             st.altair_chart(chart + lines, width="stretch")
@@ -382,18 +389,18 @@ if st.session_state.df is not None:
             
             if vol_avg < 5.5:
                 mod, targets = "Sweet Spot / Pyramidal", [10, 40, 30, 15, 5]
-                msg = f"Wenig Zeit ({vol_avg:.1f}h) im aktuellen Fenster."
+                msg = "Fokus auf Qualität statt Quantität. Nutze die begrenzte Zeit für intensivere Reize (Sweet Spot/Z4)."
             elif vol_avg < 10:
                 mod, targets = "Hybrid", [15, 60, 15, 7, 3]
-                msg = f"Mittleres Volumen ({vol_avg:.1f}h)."
+                msg = "Solide Basis mit gezielten Spitzen. Ein guter Mix, aber vermeide zu viel unproduktive 'Graue Zone' (Z3)."
             else:
                 mod, targets = "Polarized (80/20)", [25, 55, 5, 10, 5]
-                msg = f"Hohes Volumen ({vol_avg:.1f}h)."
+                msg = "Hohes Volumen erfordert Disziplin. Halte die lockeren Einheiten wirklich locker, um Ausbrennen zu verhindern."
 
             c1, c2 = st.columns(2)
             c1.metric(f"Ø Volumen (Letzte {comparison_weeks} Wo.)", f"{vol_avg:.1f} h/Woche")
             c2.metric("Empfohlenes Modell", mod)
-            st.info(msg)
+            st.info(f"💡 **Tipp für dein Volumen:** {msg}")
             
             counts = df_recent['ZoneIdx'].value_counts().sort_index()
             total = len(df_recent)
