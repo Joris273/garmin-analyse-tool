@@ -122,19 +122,34 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
         'Dauer_Sec': ['duration']
     }
 
+    # Robuste Indoor Keywords (Activity Type & Name)
+    indoor_keywords_type = ['indoor', 'virtual', 'e-sport']
+    indoor_keywords_name = ['zwift', 'indoor', 'rolle', 'trainer', 'virtual', 'bkool', 'rouvy', 'tacx', 'wahoo']
+
     for activity in raw_activities:
         act_type = activity.get('activityType', {}).get('typeKey', 'unknown').lower()
+        act_name = activity.get('activityName', 'Unbekannt')
+        act_name_lower = act_name.lower()
         
         # Filter: Nur Radsport
         if not any(x in act_type for x in ['cycling', 'biking', 'ride', 'gravel', 'mtb', 'virtual']):
             continue
 
+        # --- INDOOR DETECTION LOGIC ---
+        # 1. Prüfe offiziellen Garmin Type Key
+        is_indoor = any(k in act_type for k in indoor_keywords_type)
+        
+        # 2. Fallback: Prüfe Aktivitätsnamen, falls Type Key unklar
+        if not is_indoor:
+            is_indoor = any(k in act_name_lower for k in indoor_keywords_name)
+
         row = {
             'Datum': activity.get('startTimeLocal', '').split(' ')[0],
-            'Aktivität': activity.get('activityName', 'Unbekannt')
+            'Aktivität': act_name,
+            'Indoor': is_indoor 
         }
         
-        # Robuste Extraktion
+        # Robuste Extraktion der Messwerte
         for target_col, candidates in key_map.items():
             val = None
             for key in candidates:
@@ -182,7 +197,7 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
     # TRIMP Calculation (Vektorisiert)
     df['Stress'] = calculate_trimp_vectorized(df['Dauer_Min'], df['HF'], user_max_hr).round(1)
 
-    # Efficiency Factor (EF) = NP / HF
+    # Efficiency Factor (EF) - Standard ist NP / HF, wird aber im Dashboard dynamisch überschrieben falls gewünscht
     df['EF'] = (df['NormPower'] / df['HF']).round(2)
 
     # Zonen Bestimmung (via apply, da komplexe Logik)
@@ -220,21 +235,37 @@ def generate_demo_data(days: int = 120, user_max_hr: int = 161) -> pd.DataFrame:
         avg_hr = int(user_max_hr * 0.7)
         power = 150 + (i * 0.1) 
         
+        # Simulation von Indoor vs Outdoor
+        # HIT Einheiten oder Zufall sind oft Indoor
+        is_indoor_sim = (ride_type == 'HIT') or (random.random() > 0.75)
+        
+        act_type_key = 'cycling'
+        act_name_prefix = ""
+        
+        if is_indoor_sim:
+            act_type_key = 'virtual_ride'
+            act_name_prefix = "Zwift: "
+            # Indoor spezifisch: Kein Wind/Coasten -> VI ist niedriger, HF oft höher (Thermik)
+            thermal_drift = 5 
+        else:
+            act_name_prefix = "Outdoor "
+            thermal_drift = 0
+
         if ride_type == 'LIT': # Low Intensity
             duration = random.randint(90, 180) * load_factor
-            avg_hr = int(user_max_hr * 0.65) + random.randint(-5, 5)
+            avg_hr = int(user_max_hr * 0.65) + random.randint(-5, 5) + thermal_drift
             power = 160 + (i * 0.1)
             norm_power = power * 1.02
             max_hr_activity = avg_hr + 20
         elif ride_type == 'MIT': # Tempo / Sweetspot
             duration = random.randint(60, 90)
-            avg_hr = int(user_max_hr * 0.83) + random.randint(-5, 5)
+            avg_hr = int(user_max_hr * 0.83) + random.randint(-5, 5) + thermal_drift
             power = 200 + (i * 0.2)
             norm_power = power * 1.05
             max_hr_activity = avg_hr + 15
         else: # HIT
             duration = random.randint(45, 70)
-            avg_hr = int(user_max_hr * 0.88) + random.randint(-5, 5)
+            avg_hr = int(user_max_hr * 0.88) + random.randint(-5, 5) + thermal_drift
             power = 240 + (i * 0.3)
             norm_power = power * 1.18 # Hoher VI
             max_hr_activity = user_max_hr - random.randint(0, 5)
@@ -242,8 +273,8 @@ def generate_demo_data(days: int = 120, user_max_hr: int = 161) -> pd.DataFrame:
         # Activity Dict simulieren
         raw_act = {
             'startTimeLocal': f"{date} 10:00:00",
-            'activityName': f"{ride_type} Training",
-            'activityType': {'typeKey': 'cycling'},
+            'activityName': f"{act_name_prefix}{ride_type} Training",
+            'activityType': {'typeKey': act_type_key},
             'avgPower': power,
             'normPower': norm_power,
             'max20MinPower': power * 1.1,
@@ -252,7 +283,7 @@ def generate_demo_data(days: int = 120, user_max_hr: int = 161) -> pd.DataFrame:
             'duration': duration * 60,
             'calories': duration * 10,
             'distance': (duration/60) * 30 * 1000, 
-            'totalAscent': 500
+            'totalAscent': 0 if is_indoor_sim else 500
         }
         data.append(raw_act)
         
@@ -301,6 +332,24 @@ with st.sidebar:
         st.caption("Wie möchtest du die geladenen Daten vergleichen?")
         user_max_hr = st.number_input("Max Herzfrequenz", 100, 220, 161, help="Beeinflusst Zonen & Stress-Score.")
         
+        # --- NEU: Environment Filter ---
+        env_mode = st.radio(
+            "Umgebung / Filter", 
+            ["Alle", "Nur Outdoor", "Nur Indoor"], 
+            horizontal=True,
+            help="Indoor-Daten haben oft andere physiologische Kosten (Wärmestau, starrer Rahmen)."
+        )
+
+        # --- NEU: Power Metric Selection ---
+        power_metric_display = st.radio(
+            "Leistungs-Metrik",
+            ["Normalized Power (NP)", "Durchschnitts-Leistung"],
+            index=0,
+            help="NP gewichtet harte Belastungen stärker. Durchschnitt ist besser bei stetigen Fahrten oder wenn NP fehlt."
+        )
+        # Logik-Spalte bestimmen
+        power_col = 'NormPower' if "Normalized" in power_metric_display else 'Leistung'
+
         # State Init
         if 'df' not in st.session_state: st.session_state.df = None
         if 'raw_data' not in st.session_state: st.session_state.raw_data = None
@@ -326,10 +375,10 @@ with st.sidebar:
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
 
-st.title("🚴 Garmin Science Lab V12.4 (Optimized)")
+st.title("🚴 Garmin Science Lab V12.6 (Flex-Metrics)")
 st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
-# --- WISSENSCHAFTLICHER GUIDE (NEU & ERWEITERT) ---
+# --- WISSENSCHAFTLICHER GUIDE ---
 with st.expander("📘 Wissenschaftlicher Guide: Methodik, Physiologie & Interpretation", expanded=False):
     st.markdown("""
     ## 🧬 1. Die Physiologie der Leistung (Efficiency Factor)
@@ -337,18 +386,17 @@ with st.expander("📘 Wissenschaftlicher Guide: Methodik, Physiologie & Interpr
     **Das Prinzip der "Aeroben Entkopplung"**
     
     Dein Körper funktioniert wie ein Hybrid-Motor. Der Input ist Sauerstoff & Herzfrequenz (interne Last), der Output ist Watt (externe Last).
-    Fitness definiert sich wissenschaftlich als **Ökonomisierung**: Für denselben Watt-Output muss das Herz weniger oft schlagen, da das Schlagvolumen (Stroke Volume) durch Training steigt und die mitochondriale Dichte in den Muskeln zunimmt.
+    Fitness definiert sich wissenschaftlich als **Ökonomisierung**: Für denselben Watt-Output muss das Herz weniger oft schlagen.
     """)
     
     c1, c2 = st.columns(2)
     with c1:
-        st.info("""
+        st.info(f"""
         **📉 Der Efficiency Factor (EF)**
         
-        $$EF = \\frac{\\text{Normalized Power (NP)}}{\\text{Ø Herzfrequenz}}$$
+        $$EF = \\frac{{\\text{{{power_col}}}}}{{\\text{{Ø Herzfrequenz}}}}$$
         
         * **Steigender EF:** Deine "aerobe Maschine" wird größer. Du produzierst mehr Watt pro Herzschlag.
-        * **Stagnierender EF:** Du hast ein Plateau erreicht oder bist ermüdet.
         """)
     with c2:
         st.warning("""
@@ -388,7 +436,6 @@ with st.expander("📘 Wissenschaftlicher Guide: Methodik, Physiologie & Interpr
     **Warum Watt nicht gleich Watt ist**
     
     Der Durchschnittswert lügt. Physiologischer Stress wächst nicht linear, sondern exponentiell zur Leistung. 
-    300 Watt tun dem Körper metabolisch (Laktatakkumulation, Glykogenverarmung) viel mehr weh als 2x 150 Watt, obwohl der Durchschnitt gleich ist.
     """)
     
     c3, c4 = st.columns([1, 2])
@@ -410,21 +457,6 @@ with st.expander("📘 Wissenschaftlicher Guide: Methodik, Physiologie & Interpr
     
     * **VI 1.00 - 1.05:** Sehr stetiges Fahren (Zeitfahren, Triathlon, Grundlagentraining).
     * **VI > 1.20:** Hochgradig stochastisch (Kriterium, MTB, Hügelintervalle). 
-    * *Unser Tool nutzt den VI, um "versteckte" harte Einheiten zu erkennen, auch wenn der Durchschnittspuls niedrig war.*
-    """)
-    
-    st.divider()
-
-    st.markdown("""
-    ## 🎨 4. Polarized Training (80/20 Regel)
-    
-    **Stephen Seiler's Forschung**
-    
-    Analyse von Elite-Ausdauerathleten zeigt fast universell eine Verteilung der Intensität:
-    
-    * **~80% der Einheiten:** Zone 1 & 2 (LIT - Low Intensity). Unterhalb der aeroben Schwelle (Laktat < 2mmol). Fördert Fettstoffwechsel und Kapillarisierung ohne das vegetative Nervensystem zu stressen.
-    * **~20% der Einheiten:** Zone 4 & 5 (HIT - High Intensity). Oberhalb der Schwelle. Erhöht VO2max.
-    * **Vermeidung der "Grauen Zone" (Z3):** Zu anstrengend für reine Erholung, zu locker für maximale Adaption ("Junk Miles").
     """)
 
 # --- LOGIK EXECUTION ---
@@ -450,206 +482,236 @@ if st.session_state.df is not None and not st.session_state.df.empty:
 
 # --- DASHBOARD VISUALISIERUNG ---
 if st.session_state.df is not None and not st.session_state.df.empty:
+    
+    # 1. Filtern der Daten
     df = st.session_state.df.copy()
     
-    st.markdown(f"### 🏆 Bestwerte (Im gesamten Zeitraum)")
-    m1, m2, m3, m4 = st.columns(4)
+    # Filter: Umgebung
+    if env_mode == "Nur Outdoor":
+        if 'Indoor' in df.columns: df = df[df['Indoor'] == False]
+    elif env_mode == "Nur Indoor":
+        if 'Indoor' in df.columns: df = df[df['Indoor'] == True]
     
-    if 'Max20Min' in df and df['Max20Min'].max() > 0:
-        best_idx = df['Max20Min'].idxmax()
-        best = df.loc[best_idx]
-        m1.metric("Beste 20min Power", f"{int(best['Max20Min'])} W", best['Datum'].strftime('%d.%m.'))
-    
-    max_elev = df['Anstieg'].max()
-    if max_elev > 300:
-        idx_king = df['Anstieg'].idxmax()
-        king_stage = df.loc[idx_king]
-        m2.metric("Königsetappe", f"{int(king_stage['Anstieg'])} hm", f"{king_stage['Distanz']} km ({king_stage['Datum'].strftime('%d.%m.')})")
+    # --- NEU: Dynamische Neuberechnung Efficiency Factor basierend auf User-Wahl ---
+    # Standardmäßig ist EF = NormPower / HF. Wenn User "Durchschnittsleistung" wählt, passen wir das hier an.
+    if power_col == 'Leistung':
+        df['EF'] = (df['Leistung'] / df['HF']).round(2)
+    # Wenn power_col == 'NormPower', passt der Standardwert aus process_data bereits.
+
+    if df.empty:
+        st.warning(f"⚠️ Keine Aktivitäten gefunden für Filter: **{env_mode}**")
+        st.caption("Versuche den Zeitraum zu vergrößern oder den Filter auf 'Alle' zu setzen.")
     else:
-        idx_long = df['Distanz'].idxmax()
-        longest = df.loc[idx_long]
-        m2.metric("Weiteste Fahrt", f"{longest['Distanz']} km", longest['Datum'].strftime('%d.%m.'))
-    
-    total_km = int(df['Distanz'].sum())
-    total_hours = int(df['Dauer_Min'].sum() / 60)
-    m3.metric("Gesamtleistung", f"{total_km} km", f"{total_hours} Stunden")
-    m4.metric("Kalorien Total", f"{int(df['Kalorien'].sum()):,} kcal".replace(",", "."))
+        # --- NEU: Daten-Counter Feedback ---
+        st.info(f"📊 Analyse basiert auf **{len(df)} Aktivitäten** ({env_mode} | {power_metric_display}).")
 
-    st.divider()
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer"])
-
-    # --- TAB 1: Fitness Shift ---
-    with tab1:
-        st.caption(f"Vergleich: Erste {comparison_weeks} Wochen vs. Letzte {comparison_weeks} Wochen.")
-        df_power = df[df['NormPower'] > 0].copy()
+        st.markdown(f"### 🏆 Bestwerte ({env_mode})")
+        m1, m2, m3, m4 = st.columns(4)
         
-        if not df_power.empty:
-            min_d, max_d = df_power['Datum'].min(), df_power['Datum'].max()
-            split_early = min_d + datetime.timedelta(weeks=comparison_weeks)
-            split_late = max_d - datetime.timedelta(weeks=comparison_weeks)
-            
-            conditions = [
-                (df_power['Datum'] <= split_early),
-                (df_power['Datum'] >= split_late)
-            ]
-            choices = ["1. Start-Phase", "2. End-Phase"]
-            df_power['Phase'] = np.select(conditions, choices, default="Mitte")
-            
-            df_compare = df_power[df_power['Phase'] != "Mitte"]
-
-            chart = alt.Chart(df_compare).mark_circle(size=80).encode(
-                x=alt.X('NormPower', title='Normalized Power (Watt)', scale=alt.Scale(zero=False)),
-                y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
-                color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
-                tooltip=['Datum', 'Aktivität', 'NormPower', 'HF']
-            )
-            lines = chart.transform_regression('NormPower', 'HF', groupby=['Phase']).mark_line(size=3)
-            st.altair_chart(chart + lines, width="stretch")
-            
-            c1, c2 = st.columns(2)
-            c1.info("Ziel: Die orange Linie (End-Phase) sollte rechts unterhalb der blauen Linie (Start-Phase) liegen.")
-            
-            df_zone = df_power[(df_power['HF'] >= target_hr - hr_tol) & (df_power['HF'] <= target_hr + hr_tol)]
-            if not df_zone.empty:
-                recent_mean = df_zone[df_zone['Datum'] >= split_late]['NormPower'].mean()
-                old_mean = df_zone[df_zone['Datum'] <= split_early]['NormPower'].mean()
-                
-                if pd.notna(recent_mean) and pd.notna(old_mean):
-                    diff = int(recent_mean - old_mean)
-                    c2.metric(f"NP bei {target_hr} bpm", f"{int(recent_mean)} W", f"{diff} W")
-                else:
-                    c2.warning("Zu wenig Daten in den Phasen.")
-            else: c2.info("Keine Fahrten im gewählten Pulsbereich.")
-
-    # --- TAB 2: ACWR ---
-    with tab2:
-        daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
-        daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
-        daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
-        daily['ACWR'] = np.where(daily['Chronic'] > 0, daily['Acute'] / daily['Chronic'], 0)
-        daily.reset_index(inplace=True)
-
-        base = alt.Chart(daily).encode(x='Datum')
-        danger = alt.Chart(pd.DataFrame({'y': [1.5]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
-        line = base.mark_line(color='#10b981').encode(y=alt.Y('ACWR', scale=alt.Scale(domain=[0, 2.0])))
-        points = base.mark_circle().encode(
-            y='ACWR',
-            color=alt.condition(alt.datum.ACWR > 1.5, alt.value('red'), alt.value('#10b981')),
-            tooltip=['Datum', alt.Tooltip('ACWR', format='.2f')]
-        )
-        st.altair_chart(line + points + danger, width="stretch")
+        if 'Max20Min' in df and df['Max20Min'].max() > 0:
+            best_idx = df['Max20Min'].idxmax()
+            best = df.loc[best_idx]
+            m1.metric("Beste 20min Power", f"{int(best['Max20Min'])} W", best['Datum'].strftime('%d.%m.'))
         
-        if not daily.empty:
-            curr = daily.iloc[-1]['ACWR']
-            st.metric("ACWR Status", f"{curr:.2f}", delta="Vorsicht" if curr > 1.5 else "OK", delta_color="inverse")
-
-    # --- TAB 3: Trends ---
-    with tab3:
-        st.subheader("Detail-Analyse: Trends über Zeit")
-        c_sel1, c_sel2, c_sel3, c_sel4 = st.columns(4)
-        show_load = c_sel1.checkbox("Trainingsbelastung", value=True)
-        show_power = c_sel2.checkbox("Leistung (Watt/NP)", value=False)
-        show_hr = c_sel3.checkbox("Herzfrequenz", value=False)
-        show_ef = c_sel4.checkbox("Effizienz (EF)", value=True)
-        
-        daily_agg = df.set_index('Datum').resample('D').agg({
-            'Stress': 'sum', 
-            'Dauer_Min': 'sum',
-            'Leistung': 'mean', 
-            'NormPower': 'mean',
-            'HF': 'mean',
-            'MaxHF': 'max',
-            'EF': 'mean' 
-        }).fillna(0).reset_index()
-        
-        training_days = daily_agg[daily_agg['Dauer_Min'] > 0].copy()
-
-        if show_load:
-            base = alt.Chart(daily_agg).encode(x='Datum')
-            bar = base.mark_bar(opacity=0.3, color='purple').encode(y='Stress', tooltip='Stress')
-            line = base.mark_line(color='cyan').encode(y='Dauer_Min', tooltip='Dauer_Min')
-            st.altair_chart(alt.layer(bar, line).resolve_scale(y='independent'), width="stretch")
-        
-        if show_power:
-            base = alt.Chart(training_days[training_days['NormPower'] > 0]).encode(x='Datum')
-            l1 = base.mark_line(color='orange').encode(y='NormPower', tooltip='NormPower')
-            l2 = base.mark_line(color='gray', strokeDash=[5,5]).encode(y='Leistung', tooltip='Leistung')
-            st.altair_chart(l1 + l2, width="stretch")
-
-        if show_hr:
-            base = alt.Chart(training_days).encode(x='Datum')
-            l1 = base.mark_line(color='red').encode(y=alt.Y('MaxHF', scale=alt.Scale(zero=False)), tooltip='MaxHF')
-            l2 = base.mark_line(color='pink').encode(y=alt.Y('HF', scale=alt.Scale(zero=False)), tooltip='HF')
-            st.altair_chart(l1 + l2, width="stretch")
-
-        if show_ef:
-            ef_data = training_days[training_days['EF'] > 0].copy()
-            ef_data['EF_MA'] = ef_data['EF'].rolling(window=5, min_periods=1).mean()
-            base = alt.Chart(ef_data).encode(x='Datum')
-            points = base.mark_circle(opacity=0.3, color='green').encode(y=alt.Y('EF', scale=alt.Scale(zero=False)), tooltip='EF')
-            line = base.mark_line(color='green', size=3).encode(y='EF_MA', tooltip='EF_MA')
-            st.altair_chart(points + line, width="stretch")
-
-    # --- TAB 4: Zonen ---
-    with tab4:
-        st.subheader(f"Intensitäts-Verteilung (Letzte {comparison_weeks} Wochen)")
-        
-        max_date = df['Datum'].max()
-        start_analysis = max_date - datetime.timedelta(weeks=comparison_weeks)
-        df_recent = df[df['Datum'] >= start_analysis].copy()
-        
-        if not df_recent.empty:
-            vol_total = df_recent['Dauer_Min'].sum() / 60
-            vol_avg = vol_total / comparison_weeks 
-            
-            if vol_avg < 5.5:
-                mod, targets = "Sweet Spot / Pyramidal", [10, 40, 30, 15, 5]
-                msg = "Fokus auf Qualität statt Quantität."
-            elif vol_avg < 10:
-                mod, targets = "Hybrid", [15, 60, 15, 7, 3]
-                msg = "Solide Basis mit gezielten Spitzen."
-            else:
-                mod, targets = "Polarized (80/20)", [25, 55, 5, 10, 5]
-                msg = "Hohes Volumen erfordert Disziplin (LIT muss LIT bleiben)."
-
-            c1, c2 = st.columns(2)
-            c1.metric(f"Ø Volumen", f"{vol_avg:.1f} h/Woche")
-            c2.metric("Empfohlenes Modell", mod)
-            st.info(msg)
-            
-            counts = df_recent['ZoneIdx'].value_counts().sort_index()
-            total_count = len(df_recent)
-            labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
-            
-            st.divider()
-            cols = st.columns(5)
-            comp_data = []
-            
-            for i in range(5):
-                act_pct = (counts.get(i, 0) / total_count * 100) if total_count > 0 else 0
-                delta = act_pct - targets[i]
-                
-                with cols[i]:
-                    st.markdown(f"**{labels[i]}**")
-                    st.progress(min(act_pct/100, 1.0))
-                    st.metric("Anteil", f"{int(act_pct)}%", f"{int(delta)}% vs Ziel", delta_color="inverse")
-                
-                comp_data.extend([
-                    {"Zone": labels[i], "Typ": "Ist", "Prozent": act_pct},
-                    {"Zone": labels[i], "Typ": "Soll", "Prozent": targets[i]}
-                ])
-                
-            chart = alt.Chart(pd.DataFrame(comp_data)).mark_bar().encode(
-                x=alt.X('Zone', sort=labels),
-                y='Prozent',
-                color='Typ',
-                xOffset='Typ',
-                tooltip=['Zone', 'Typ', alt.Tooltip('Prozent', format='.1f')]
-            )
-            st.altair_chart(chart, width="stretch")
+        max_elev = df['Anstieg'].max()
+        if max_elev > 300:
+            idx_king = df['Anstieg'].idxmax()
+            king_stage = df.loc[idx_king]
+            m2.metric("Königsetappe", f"{int(king_stage['Anstieg'])} hm", f"{king_stage['Distanz']} km ({king_stage['Datum'].strftime('%d.%m.')})")
         else:
-            st.warning("Keine Daten im gewählten Zeitraum.")
+            idx_long = df['Distanz'].idxmax()
+            longest = df.loc[idx_long]
+            m2.metric("Weiteste Fahrt", f"{longest['Distanz']} km", longest['Datum'].strftime('%d.%m.'))
+        
+        total_km = int(df['Distanz'].sum())
+        total_hours = int(df['Dauer_Min'].sum() / 60)
+        m3.metric("Gesamtleistung", f"{total_km} km", f"{total_hours} Stunden")
+        m4.metric("Kalorien Total", f"{int(df['Kalorien'].sum()):,} kcal".replace(",", "."))
+
+        st.divider()
+        
+        tab1, tab2, tab3, tab4 = st.tabs(["🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer"])
+
+        # --- TAB 1: Fitness Shift ---
+        with tab1:
+            st.caption(f"Vergleich: Erste {comparison_weeks} Wochen vs. Letzte {comparison_weeks} Wochen.")
+            
+            # --- NEU: Nutzt power_col dynamisch ---
+            df_power = df[df[power_col] > 0].copy()
+            
+            if not df_power.empty:
+                min_d, max_d = df_power['Datum'].min(), df_power['Datum'].max()
+                split_early = min_d + datetime.timedelta(weeks=comparison_weeks)
+                split_late = max_d - datetime.timedelta(weeks=comparison_weeks)
+                
+                conditions = [
+                    (df_power['Datum'] <= split_early),
+                    (df_power['Datum'] >= split_late)
+                ]
+                choices = ["1. Start-Phase", "2. End-Phase"]
+                df_power['Phase'] = np.select(conditions, choices, default="Mitte")
+                
+                df_compare = df_power[df_power['Phase'] != "Mitte"]
+                
+                if not df_compare.empty:
+                    chart = alt.Chart(df_compare).mark_circle(size=80).encode(
+                        # --- NEU: Dynamische X-Achse ---
+                        x=alt.X(power_col, title=f'{power_metric_display} (Watt)', scale=alt.Scale(zero=False)),
+                        y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
+                        color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
+                        tooltip=['Datum', 'Aktivität', power_col, 'HF', 'Indoor']
+                    )
+                    # Regression auf gewählter Spalte
+                    lines = chart.transform_regression(power_col, 'HF', groupby=['Phase']).mark_line(size=3)
+                    st.altair_chart(chart + lines, width="stretch")
+                    
+                    c1, c2 = st.columns(2)
+                    c1.info("Ziel: Die orange Linie (End-Phase) sollte rechts unterhalb der blauen Linie (Start-Phase) liegen.")
+                    
+                    df_zone = df_power[(df_power['HF'] >= target_hr - hr_tol) & (df_power['HF'] <= target_hr + hr_tol)]
+                    if not df_zone.empty:
+                        # --- NEU: Berechnung auf power_col ---
+                        recent_mean = df_zone[df_zone['Datum'] >= split_late][power_col].mean()
+                        old_mean = df_zone[df_zone['Datum'] <= split_early][power_col].mean()
+                        
+                        if pd.notna(recent_mean) and pd.notna(old_mean):
+                            diff = int(recent_mean - old_mean)
+                            c2.metric(f"{power_metric_display} bei {target_hr} bpm", f"{int(recent_mean)} W", f"{diff} W")
+                        else:
+                            c2.warning("Zu wenig Daten in einer der Phasen für direkten Vergleich.")
+                    else: c2.info("Keine Fahrten im gewählten Pulsbereich.")
+                else:
+                    st.warning("Nicht genug Datenpunkte für einen Phasenvergleich.")
+
+        # --- TAB 2: ACWR ---
+        with tab2:
+            daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
+            daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
+            daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
+            daily['ACWR'] = np.where(daily['Chronic'] > 0, daily['Acute'] / daily['Chronic'], 0)
+            daily.reset_index(inplace=True)
+
+            base = alt.Chart(daily).encode(x='Datum')
+            danger = alt.Chart(pd.DataFrame({'y': [1.5]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
+            line = base.mark_line(color='#10b981').encode(y=alt.Y('ACWR', scale=alt.Scale(domain=[0, 2.0])))
+            points = base.mark_circle().encode(
+                y='ACWR',
+                color=alt.condition(alt.datum.ACWR > 1.5, alt.value('red'), alt.value('#10b981')),
+                tooltip=['Datum', alt.Tooltip('ACWR', format='.2f')]
+            )
+            st.altair_chart(line + points + danger, width="stretch")
+            
+            if not daily.empty:
+                curr = daily.iloc[-1]['ACWR']
+                st.metric("ACWR Status", f"{curr:.2f}", delta="Vorsicht" if curr > 1.5 else "OK", delta_color="inverse")
+
+        # --- TAB 3: Trends ---
+        with tab3:
+            st.subheader("Detail-Analyse: Trends über Zeit")
+            c_sel1, c_sel2, c_sel3, c_sel4 = st.columns(4)
+            show_load = c_sel1.checkbox("Trainingsbelastung", value=True)
+            # --- NEU: Checkbox Name angepasst ---
+            show_power = c_sel2.checkbox(f"Leistung ({power_metric_display})", value=False)
+            show_hr = c_sel3.checkbox("Herzfrequenz", value=False)
+            show_ef = c_sel4.checkbox("Effizienz (EF)", value=True)
+            
+            daily_agg = df.set_index('Datum').resample('D').agg({
+                'Stress': 'sum', 
+                'Dauer_Min': 'sum',
+                'Leistung': 'mean', 
+                'NormPower': 'mean',
+                'HF': 'mean',
+                'MaxHF': 'max',
+                'EF': 'mean' 
+            }).fillna(0).reset_index()
+            
+            training_days = daily_agg[daily_agg['Dauer_Min'] > 0].copy()
+
+            if show_load:
+                base = alt.Chart(daily_agg).encode(x='Datum')
+                bar = base.mark_bar(opacity=0.3, color='purple').encode(y='Stress', tooltip='Stress')
+                line = base.mark_line(color='cyan').encode(y='Dauer_Min', tooltip='Dauer_Min')
+                st.altair_chart(alt.layer(bar, line).resolve_scale(y='independent'), width="stretch")
+            
+            if show_power:
+                # --- NEU: Zeigt primär die gewählte Spalte an ---
+                base = alt.Chart(training_days[training_days[power_col] > 0]).encode(x='Datum')
+                l1 = base.mark_line(color='orange').encode(y=power_col, tooltip=power_col)
+                st.altair_chart(l1, width="stretch")
+
+            if show_hr:
+                base = alt.Chart(training_days).encode(x='Datum')
+                l1 = base.mark_line(color='red').encode(y=alt.Y('MaxHF', scale=alt.Scale(zero=False)), tooltip='MaxHF')
+                l2 = base.mark_line(color='pink').encode(y=alt.Y('HF', scale=alt.Scale(zero=False)), tooltip='HF')
+                st.altair_chart(l1 + l2, width="stretch")
+
+            if show_ef:
+                ef_data = training_days[training_days['EF'] > 0].copy()
+                ef_data['EF_MA'] = ef_data['EF'].rolling(window=5, min_periods=1).mean()
+                base = alt.Chart(ef_data).encode(x='Datum')
+                points = base.mark_circle(opacity=0.3, color='green').encode(y=alt.Y('EF', scale=alt.Scale(zero=False)), tooltip='EF')
+                line = base.mark_line(color='green', size=3).encode(y='EF_MA', tooltip='EF_MA')
+                st.altair_chart(points + line, width="stretch")
+
+        # --- TAB 4: Zonen ---
+        with tab4:
+            st.subheader(f"Intensitäts-Verteilung (Letzte {comparison_weeks} Wochen)")
+            
+            max_date = df['Datum'].max()
+            start_analysis = max_date - datetime.timedelta(weeks=comparison_weeks)
+            df_recent = df[df['Datum'] >= start_analysis].copy()
+            
+            if not df_recent.empty:
+                vol_total = df_recent['Dauer_Min'].sum() / 60
+                vol_avg = vol_total / comparison_weeks 
+                
+                if vol_avg < 5.5:
+                    mod, targets = "Sweet Spot / Pyramidal", [10, 40, 30, 15, 5]
+                    msg = "Fokus auf Qualität statt Quantität."
+                elif vol_avg < 10:
+                    mod, targets = "Hybrid", [15, 60, 15, 7, 3]
+                    msg = "Solide Basis mit gezielten Spitzen."
+                else:
+                    mod, targets = "Polarized (80/20)", [25, 55, 5, 10, 5]
+                    msg = "Hohes Volumen erfordert Disziplin (LIT muss LIT bleiben)."
+
+                c1, c2 = st.columns(2)
+                c1.metric(f"Ø Volumen", f"{vol_avg:.1f} h/Woche")
+                c2.metric("Empfohlenes Modell", mod)
+                st.info(msg)
+                
+                counts = df_recent['ZoneIdx'].value_counts().sort_index()
+                total_count = len(df_recent)
+                labels = ["Z1 (Erholung)", "Z2 (Grundlage)", "Z3 (Tempo)", "Z4 (Schwelle)", "Z5 (Max)"]
+                
+                st.divider()
+                cols = st.columns(5)
+                comp_data = []
+                
+                for i in range(5):
+                    act_pct = (counts.get(i, 0) / total_count * 100) if total_count > 0 else 0
+                    delta = act_pct - targets[i]
+                    
+                    with cols[i]:
+                        st.markdown(f"**{labels[i]}**")
+                        st.progress(min(act_pct/100, 1.0))
+                        st.metric("Anteil", f"{int(act_pct)}%", f"{int(delta)}% vs Ziel", delta_color="inverse")
+                    
+                    comp_data.extend([
+                        {"Zone": labels[i], "Typ": "Ist", "Prozent": act_pct},
+                        {"Zone": labels[i], "Typ": "Soll", "Prozent": targets[i]}
+                    ])
+                    
+                chart = alt.Chart(pd.DataFrame(comp_data)).mark_bar().encode(
+                    x=alt.X('Zone', sort=labels),
+                    y='Prozent',
+                    color='Typ',
+                    xOffset='Typ',
+                    tooltip=['Zone', 'Typ', alt.Tooltip('Prozent', format='.1f')]
+                )
+                st.altair_chart(chart, width="stretch")
+            else:
+                st.warning("Keine Daten im gewählten Zeitraum.")
 
 elif st.session_state.df is None and not start_btn and not demo_btn:
     st.info("👈 Bitte links starten.")
