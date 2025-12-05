@@ -3,6 +3,7 @@ import os
 import datetime
 import random
 import pickle
+import hashlib
 from typing import List, Optional, Tuple, Dict, Any
 
 import streamlit as st
@@ -15,9 +16,9 @@ import numpy as np
 from garminconnect import Garmin
 
 # --- KONSTANTEN ---
-CACHE_FILE = "garmin_cache.pkl"
+# CACHE_FILE = "garmin_cache.pkl" # Deprecated: Now dynamic per user
 # Buffer für ACWR Berechnung (Chronic Load braucht 28 Tage Vorlauf + Puffer)
-ACWR_BUFFER_DAYS = 35 
+ACWR_BUFFER_DAYS = 45 # Erhöht auf 45 für sicheren CTL Anlauf (42 Tage Span)
 
 # --- 1. AUTOMATISCHER STARTER ---
 if __name__ == "__main__":
@@ -32,7 +33,7 @@ try:
 except Exception:
     pass
 
-# --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC) ---
+# --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC - UNVERÄNDERT) ---
 
 def calculate_trimp_vectorized(duration_min: pd.Series, avg_hr: pd.Series, max_hr_user: int) -> pd.Series:
     """
@@ -103,13 +104,73 @@ def calculate_zones_vectorized(df: pd.DataFrame, user_max_hr: int) -> pd.Series:
 
     return pd.Series(base_zone, index=df.index).astype(int)
 
+# --- NEUE WISSENSCHAFTLICHE FUNKTIONEN (ADDITIV) ---
+
+def calculate_pmc_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Berechnet CTL, ATL und TSB für das Performance Management Chart.
+    Nutzt TRIMP (Stress) als Basis.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    # 1. Resampling auf tägliche Basis (auffüllen fehlender Tage mit 0)
+    daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
+    
+    # 2. Berechnung EWMA (Exponential Weighted Moving Average)
+    # CTL = Fitness (42 Tage), ATL = Fatigue (7 Tage)
+    daily['CTL'] = daily['Stress'].ewm(span=42, adjust=False).mean()
+    daily['ATL'] = daily['Stress'].ewm(span=7, adjust=False).mean()
+    
+    # 3. TSB = Form (Training Stress Balance)
+    daily['TSB'] = daily['CTL'] - daily['ATL']
+    
+    daily.reset_index(inplace=True)
+    return daily
+
+def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[float, float, bool]:
+    """
+    Berechnet Monotonie und Strain nach Foster für die letzten X Tage.
+    Monotonie = Durchschnittl. täglicher Load / Standardabweichung.
+    Rückgabe: (Monotonie, Strain, Warnung_Flag)
+    """
+    if df.empty:
+        return 0.0, 0.0, False
+
+    daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0)
+    recent = daily.tail(window_days)
+    
+    avg_load = recent.mean()
+    std_load = recent.std()
+    
+    if std_load == 0:
+        monotony = 0.0 # Vermeidung Div/0 bei nur einem Wert oder identischen Werten
+    else:
+        monotony = avg_load / std_load
+        
+    strain = recent.sum() * monotony
+    
+    # Warnung wenn Monotonie > 2.0 (Gefahr von Overtraining/Stagnation)
+    warning = monotony > 2.0 and recent.sum() > 200 # Nur warnen wenn auch Last da ist
+    
+    return round(monotony, 2), round(strain, 0), warning
+
 # --- CACHE MANAGEMENT (ROBUST) ---
 
-def load_local_cache() -> List[Dict]:
-    """Lädt die lokalen Rohdaten, falls vorhanden."""
-    if os.path.exists(CACHE_FILE):
+def get_cache_filename(email: str) -> str:
+    """Erstellt einen sicheren, anonymen Dateinamen für den Cache basierend auf der E-Mail."""
+    if not email:
+        return "garmin_cache_unknown.pkl"
+    # E-Mail normalisieren und hashen
+    email_hash = hashlib.sha256(email.strip().lower().encode('utf-8')).hexdigest()
+    return f"garmin_cache_{email_hash}.pkl"
+
+def load_local_cache(email: str) -> List[Dict]:
+    """Lädt die lokalen Rohdaten für den spezifischen Nutzer, falls vorhanden."""
+    cache_file = get_cache_filename(email)
+    if os.path.exists(cache_file):
         try:
-            with open(CACHE_FILE, "rb") as f:
+            with open(cache_file, "rb") as f:
                 data = pickle.load(f)
                 if isinstance(data, list):
                     return data
@@ -117,10 +178,11 @@ def load_local_cache() -> List[Dict]:
             pass # Korrupter Cache oder Fehler
     return []
 
-def save_local_cache(data: List[Dict]):
-    """Speichert Rohdaten binär."""
+def save_local_cache(data: List[Dict], email: str):
+    """Speichert Rohdaten binär für den spezifischen Nutzer."""
+    cache_file = get_cache_filename(email)
     try:
-        with open(CACHE_FILE, "wb") as f:
+        with open(cache_file, "wb") as f:
             pickle.dump(data, f)
     except Exception as e:
         print(f"Cache Save Error: {e}")
@@ -275,7 +337,7 @@ def generate_demo_data(days: int = 120, user_max_hr: int = 161) -> pd.DataFrame:
     random.seed(42)
     data = []
     today = datetime.date.today()
-    total_days = days + 35 
+    total_days = days + 45 # Buffer erhöht
     
     for i in range(total_days):
         if random.random() > 0.6: continue 
@@ -382,11 +444,15 @@ with st.sidebar:
         demo_btn = c2.button("Demo")
 
         if st.button("Cache leeren"):
-            if os.path.exists(CACHE_FILE):
-                os.remove(CACHE_FILE)
-                st.toast("Cache gelöscht!", icon="🗑️")
+            if email:
+                c_file = get_cache_filename(email)
+                if os.path.exists(c_file):
+                    os.remove(c_file)
+                    st.toast("Dein Cache wurde gelöscht!", icon="🗑️")
+                else:
+                    st.toast("Kein Cache für diesen Account gefunden.")
             else:
-                st.toast("Cache war bereits leer.")
+                st.error("Bitte gib zuerst eine E-Mail-Adresse ein.")
         
     with tab_params:
         st.subheader("2. Analyse-Fokus")
@@ -429,9 +495,17 @@ with st.sidebar:
         
         target_hr = st.slider("Aerobe Schwelle (Vergleichs-Puls)", 100, 170, 135)
         hr_tol = st.slider("Toleranz (+/- bpm)", 2, 15, 5)
+        
+        # --- NEW: Monotony Logic in Sidebar ---
+        if st.session_state.df is not None and not st.session_state.df.empty:
+            monotony, strain_val, mono_warning = calculate_monotony_strain(st.session_state.df, 7)
+            if mono_warning:
+                st.error(f"⚠️ **Monotonie-Alarm ({monotony}):** Training zu eintönig! Risiko für Overtraining.")
+            elif monotony > 1.5:
+                st.warning(f"ℹ️ **Hohe Monotonie ({monotony}):** Variiere Intensität mehr.")
 
-st.title("🚴 Garmin Science Lab V13.3 (Ultimate Edition)")
-st.markdown("Analyse von **Effizienz**, **Belastung (ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
+st.title("🚴 Garmin Science Lab V14 (Pro Edition)")
+st.markdown("Analyse von **Effizienz**, **Belastung (PMC/ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
 # --- WISSENSCHAFTLICHER GUIDE (MASTERCLASS) ---
 with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Masterclass)", expanded=False):
@@ -441,7 +515,7 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
     Hier verstehst du, was die Metriken bedeuten und wie du sie zur Steuerung nutzt.
     """)
     
-    g_tab1, g_tab2, g_tab3, g_tab4 = st.tabs(["🧬 Physiologie & Effizienz (EF)", "⚖️ Belastungs-Steuerung (ACWR)", "📈 Training Stress (TRIMP)", "🎯 Zonen-Modelle"])
+    g_tab1, g_tab2, g_tab3, g_tab4, g_tab5 = st.tabs(["🧬 Physiologie & Effizienz (EF)", "⚖️ Belastungs-Steuerung (ACWR)", "🚀 PMC (Form)", "📈 Training Stress (TRIMP)", "🎯 Zonen-Modelle"])
     
     with g_tab1:
         st.markdown("#### Der Efficiency Factor (EF)")
@@ -484,6 +558,21 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
             st.error("**> 1.5 (Danger Zone):** Die Belastung steigt viel schneller als die Anpassung des Körpers (Sehnen, Bänder). Akute Gefahr!")
 
     with g_tab3:
+        st.markdown("#### Performance Management Chart (PMC)")
+        st.markdown("""
+        Das Standard-Tool im Radsport (ähnlich TrainingPeaks), um "Form" zu berechnen.
+        """)
+        st.latex(r"TSB = CTL (Fitness) - ATL (Fatigue)")
+        st.markdown("""
+        * **CTL (Fitness):** Deine chronische Trainingslast (Last 42 Tage). Diesen Wert willst du langfristig steigern.
+        * **ATL (Fatigue):** Deine akute Ermüdung (Last 7 Tage).
+        * **TSB (Form):** Deine "Frische".
+            * **Positiv (+10 bis +25):** Tapering / Rennbereit.
+            * **Neutral (-10 bis +10):** Normales Training.
+            * **Negativ (<-20):** Harter Trainingsblock (Overloading).
+        """)
+
+    with g_tab4:
         st.markdown("#### TRIMP (Training Impulse)")
         st.markdown("""
         Warum zählen wir nicht einfach Kilometer? Weil 100km locker nicht denselben Stress erzeugen wie 100km Rennen.
@@ -499,7 +588,7 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
         * **Nutzen:** TRIMP ist die Basis für alle Belastungskurven (Fitness vs. Fatigue).
         """)
 
-    with g_tab4:
+    with g_tab5:
         st.markdown("#### Trainingsverteilung: Polarized vs. Pyramidal")
         st.markdown("Wie viel Zeit solltest du in welcher Zone verbringen? Zwei Modelle dominieren die Wissenschaft:")
         
@@ -531,7 +620,7 @@ if start_btn and email and password:
     with st.spinner("Synchronisiere Daten..."):
         existing_data = []
         if use_cache:
-            existing_data = load_local_cache()
+            existing_data = load_local_cache(email)
         
         buffer_delta = datetime.timedelta(days=ACWR_BUFFER_DAYS)
         fetch_start_date = start_date - buffer_delta
@@ -556,7 +645,7 @@ if start_btn and email and password:
         else:
             total_raw = merge_activities(existing_data, new_data)
             if use_cache and new_data:
-                save_local_cache(total_raw)
+                save_local_cache(total_raw, email)
                 st.toast(f"{len(new_data)} neue Aktivitäten geladen.", icon="💾")
             elif not use_cache:
                 total_raw = new_data
@@ -608,22 +697,77 @@ if st.session_state.df is not None and not st.session_state.df.empty:
         weeks_in_view = max(1, (end_date - start_date).days // 7)
         dist_avg = int(df_view['Distanz'].sum() / weeks_in_view)
         
+        # --- NEW: Season Best Calculations ---
+        # Bestimme All-Time/Season Best aus der vollen History
+        sb_max_power_20 = df_full_history['Max20Min'].max() if 'Max20Min' in df_full_history else 0
+        
         m1, m2, m3, m4 = st.columns(4)
         
         m1.metric("Anzahl Aktivitäten", act_count, help="Anzahl der Fahrten, die in die Berechnung einfließen.")
         
         if 'Max20Min' in df_view and df_view['Max20Min'].max() > 0:
-            best = df_view.loc[df_view['Max20Min'].idxmax()]
-            m2.metric("Best 20min Power", f"{int(best['Max20Min'])} W", f"am {best['Datum'].strftime('%d.%m.')}")
+            best_idx = df_view['Max20Min'].idxmax()
+            best = df_view.loc[best_idx]
+            current_best = int(best['Max20Min'])
+            
+            delta_str = ""
+            if sb_max_power_20 > 0:
+                pct = (current_best / sb_max_power_20) * 100
+                delta_str = f"{int(pct)}% of Season Best ({int(sb_max_power_20)} W)"
+            
+            m2.metric("Best 20min Power", f"{current_best} W", delta_str, help="Vergleich zum All-Time/Season High")
         
         m3.metric("Gesamtstrecke", f"{int(df_view['Distanz'].sum())} km", f"Ø {dist_avg} km/Woche")
         m4.metric("Kalorien", f"{int(df_view['Kalorien'].sum()):,} kcal".replace(",", "."), f"Ø {int(df_view['Kalorien'].sum()/weeks_in_view)} kcal/Woche")
 
         st.divider()
-        tab1, tab2, tab3, tab4 = st.tabs(["🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 PMC & Form", "🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer"])
 
-        # TAB 1: FITNESS SHIFT (MIT EINORDNUNG)
+        # TAB 1: PMC (NEW FEATURE)
         with tab1:
+            st.markdown("##### Performance Management Chart (Fitness vs. Fatigue)")
+            # Berechne PMC auf voller Historie damit EMA korrekt anläuft
+            df_pmc_full = calculate_pmc_stats(df_full_history)
+            
+            if not df_pmc_full.empty:
+                # Filter auf View Range für Plot
+                mask_pmc = (df_pmc_full['Datum'].dt.date >= start_date) & (df_pmc_full['Datum'].dt.date <= end_date)
+                df_pmc_view = df_pmc_full[mask_pmc].copy()
+                
+                if not df_pmc_view.empty:
+                    # Altair Plot: CTL (Area), ATL (Line), TSB (Bar/Area)
+                    base_pmc = alt.Chart(df_pmc_view).encode(x='Datum')
+                    
+                    ctl_chart = base_pmc.mark_area(opacity=0.3, color='#3b82f6').encode(
+                        y=alt.Y('CTL', title='Fitness (CTL) / Fatigue (ATL)'),
+                        tooltip=['Datum', alt.Tooltip('CTL', format='.1f'), alt.Tooltip('ATL', format='.1f')]
+                    )
+                    
+                    atl_chart = base_pmc.mark_line(color='#d946ef', strokeDash=[2,2]).encode(y='ATL')
+                    
+                    tsb_chart = base_pmc.mark_bar(opacity=0.8).encode(
+                        y=alt.Y('TSB', title='Form (TSB)'),
+                        color=alt.condition(alt.datum.TSB >= 0, alt.value('#10b981'), alt.value('#ef4444')),
+                        tooltip=['Datum', alt.Tooltip('TSB', format='.1f')]
+                    ).properties(height=100)
+                    
+                    # Combine layers: Top chart (Fitness/Fatigue), Bottom chart (Form)
+                    combined = alt.vconcat(
+                        (ctl_chart + atl_chart).properties(height=250, width="container"),
+                        tsb_chart.properties(height=100, width="container")
+                    ).resolve_scale(x='shared')
+                    
+                    st.altair_chart(combined, use_container_width=True)
+                    
+                    curr_tsb = df_pmc_view.iloc[-1]['TSB']
+                    st.caption(f"Aktuelle Form (TSB): {curr_tsb:.1f}")
+                else:
+                    st.info("Keine PMC Daten im gewählten Zeitraum.")
+            else:
+                st.warning("Zu wenig Datenhistorie für PMC Berechnung.")
+
+        # TAB 2: FITNESS SHIFT (MIT TRUE AEROBIC FILTER)
+        with tab2:
             st.caption(f"Vergleich: Erste {comparison_weeks} Wochen vs. Letzte {comparison_weeks} Wochen.")
             df_power = df_view[df_view[power_col] > 0].copy()
             if not df_power.empty and act_count >= 4:
@@ -635,14 +779,48 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                 df_compare = df_power[df_power['Phase'] != "Mitte"]
                 
                 if not df_compare.empty:
-                    chart = alt.Chart(df_compare).mark_circle(size=80).encode(
-                        x=alt.X(power_col, title=f'{power_metric_display} (Watt)', scale=alt.Scale(zero=False)),
-                        y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
-                        color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
-                        tooltip=['Datum', 'Aktivität', power_col, 'HF']
-                    )
-                    lines = chart.transform_regression(power_col, 'HF', groupby=['Phase']).mark_line(size=3)
-                    st.altair_chart(chart + lines, width="stretch")
+                    c1, c2 = st.columns([2, 1])
+                    
+                    with c1:
+                        st.markdown("**All Activities: Power vs Heart Rate**")
+                        chart = alt.Chart(df_compare).mark_circle(size=80).encode(
+                            x=alt.X(power_col, title=f'{power_metric_display} (Watt)', scale=alt.Scale(zero=False)),
+                            y=alt.Y('HF', title='Herzfrequenz (bpm)', scale=alt.Scale(zero=False)),
+                            color=alt.Color('Phase', scale=alt.Scale(range=['#3b82f6', '#f97316'])),
+                            tooltip=['Datum', 'Aktivität', power_col, 'HF']
+                        )
+                        lines = chart.transform_regression(power_col, 'HF', groupby=['Phase']).mark_line(size=3)
+                        st.altair_chart(chart + lines, use_container_width=True)
+                    
+                    with c2:
+                        st.markdown("**True Aerobic Efficiency (Z2 > 60min)**")
+                        # Filter: Nur Zone 2 (ZoneIdx == 1) und länger als 60 Min
+                        mask_true_aero = (df_view['ZoneIdx'] == 1) & (df_view['Dauer_Min'] > 60)
+                        df_z2_pure = df_view[mask_true_aero].copy()
+                        
+                        if not df_z2_pure.empty:
+                            # FIX: Explizite Typisierung (:T, :Q) und Conditional Regression für Altair Robustheit
+                            base_chart = alt.Chart(df_z2_pure).mark_circle(color='green', size=60).encode(
+                                x=alt.X('Datum:T', title='Datum'),
+                                y=alt.Y('EF:Q', scale=alt.Scale(zero=False), title="EF (Z2 Only)"),
+                                tooltip=[
+                                    alt.Tooltip('Datum:T', format='%d.%m.%Y'),
+                                    alt.Tooltip('EF:Q', format='.2f'),
+                                    alt.Tooltip('Dauer_Min:Q', title='Dauer (min)')
+                                ]
+                            )
+                            
+                            # Regression nur zeichnen wenn genug Datenpunkte da sind, sonst crashed das Chart bei Zoom/wenig Daten
+                            if len(df_z2_pure) > 2:
+                                reg_line = base_chart.transform_regression('Datum', 'EF').mark_line(color='gray', strokeDash=[4,4])
+                                final_chart = base_chart + reg_line
+                            else:
+                                final_chart = base_chart
+                                
+                            st.altair_chart(final_chart, use_container_width=True)
+                            st.caption(f"Zeigt nur 'reine' Grundlageneinheiten ({len(df_z2_pure)}) ohne Intervalleinfluss.")
+                        else:
+                            st.info("Keine reinen Z2-Einheiten (>60min) gefunden.")
                     
                     df_zone = df_power[(df_power['HF'] >= target_hr - hr_tol) & (df_power['HF'] <= target_hr + hr_tol)]
                     if not df_zone.empty:
@@ -651,19 +829,18 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                         
                         if pd.notna(recent_mean) and pd.notna(old_mean):
                             diff = int(recent_mean - old_mean)
-                            c1, c2 = st.columns([1, 2])
-                            c1.metric(f"Leistung bei ~{target_hr} bpm", f"{int(recent_mean)} W", f"{diff} W vs Start")
+                            st.divider()
+                            k1, k2 = st.columns([1, 2])
+                            k1.metric(f"Leistung bei ~{target_hr} bpm", f"{int(recent_mean)} W", f"{diff} W vs Start")
                             
-                            with c2:
+                            with k2:
                                 if diff > 5: st.success(f"👏 **Positiver Trend:** Du leistest {diff} Watt mehr bei gleichem Puls. Deine Effizienz ist gestiegen!")
                                 elif diff < -5: st.error(f"📉 **Negativer Trend:** Du leistest {abs(diff)} Watt weniger. Mögliche Ursachen: Ermüdung, Krankheit oder Trainingspause.")
                                 else: st.info("➡️ **Plateau:** Deine aerobe Effizienz ist im gewählten Zeitraum stabil geblieben.")
-                        else: st.warning("Nicht genügend Datenpunkte in beiden Phasen für einen numerischen Vergleich.")
-                    else: st.info(f"Keine Aktivitäten im Pulsbereich {target_hr} +/- {hr_tol} bpm gefunden.")
             else: st.warning("Zu wenig Daten für einen Phasen-Vergleich.")
 
-        # TAB 2: ACWR
-        with tab2:
+        # TAB 3: ACWR
+        with tab3:
             daily = df_full_history.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
             daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
             daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
@@ -686,8 +863,8 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                 elif curr < 0.8: st.warning(f"📉 **ACWR Low ({curr:.2f}):** Detraining möglich. Intensität/Volumen steigern.")
                 else: st.success(f"✅ **ACWR Optimal ({curr:.2f}):** Sweet Spot Training.")
 
-        # TAB 3: TRENDS
-        with tab3:
+        # TAB 4: TRENDS
+        with tab4:
             daily_agg = df_view.set_index('Datum').resample('D').agg({
                 'Stress': 'sum', 'Dauer_Min': 'sum', 'Leistung': 'mean', 'HF': 'mean', 'EF': 'mean' 
             }).fillna(0).reset_index()
@@ -704,8 +881,8 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                            alt.Chart(ef_data).mark_line(color='green').encode(x='Datum', y='EF_MA')
                 st.altair_chart(chart_ef, width="stretch")
 
-        # TAB 4: ZONEN-OPTIMIERER
-        with tab4:
+        # TAB 5: ZONEN-OPTIMIERER
+        with tab5:
             max_date = df_view['Datum'].max()
             start_analysis = max_date - datetime.timedelta(weeks=comparison_weeks)
             df_recent = df_view[df_view['Datum'] >= start_analysis].copy()
