@@ -41,23 +41,21 @@ try:
 except Exception:
     pass
 
-# --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC - KORRIGIERT) ---
+# --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC) ---
 
 def calculate_trimp_vectorized(duration_min: pd.Series, avg_hr: pd.Series, max_hr_user: int) -> pd.Series:
     """
     Berechnet den TRIMP (Training Impulse) nach Banister (Vektorisiert).
     Formel: Dauer(min) * Intensität * 0.64 * exp(1.92 * Intensität)
-    Scientific Fix: Faktor 0.64 (für Männer Standard) hinzugefügt.
     """
     if max_hr_user <= 0:
         return pd.Series(0.0, index=duration_min.index)
     
-    # Intensität (Heart Rate Reserve wäre genauer, aber MaxHR ist hier der Standard)
+    # Intensität
     intensity = avg_hr / max_hr_user
     intensity = intensity.fillna(0).clip(lower=0)
     
-    # Banister Gewichtungsfaktor (1.92 für Männer, 1.67 für Frauen - hier Default 1.92)
-    # Fix: Faktor 0.64 ergänzt für korrekte Skalierung
+    # Banister Gewichtungsfaktor (mit Skalierung 0.64 für Männer Standard)
     weighting = 0.64 * np.exp(1.92 * intensity)
     
     return duration_min * intensity * weighting
@@ -65,7 +63,6 @@ def calculate_trimp_vectorized(duration_min: pd.Series, avg_hr: pd.Series, max_h
 def calculate_zones_vectorized(df: pd.DataFrame, user_max_hr: int) -> pd.Series:
     """
     Bestimmt die Trainingszone intelligent unter Berücksichtigung von Variabilität (VI).
-    Vollständig vektorisiert mit NumPy für Performance.
     """
     if user_max_hr <= 0:
         return pd.Series(0, index=df.index)
@@ -77,8 +74,6 @@ def calculate_zones_vectorized(df: pd.DataFrame, user_max_hr: int) -> pd.Series:
 
     # Prozent vom Max Puls
     avg_pct = avg_hr / user_max_hr
-    
-    # Fallback: Wenn MaxHF der Aktivität fehlt, nimm AvgHF (vermeidet NaN)
     max_pct = np.where(max_hr_activity > 0, max_hr_activity / user_max_hr, avg_pct)
 
     # 1. Basis-Klassifizierung nach HF Durchschnitt
@@ -92,60 +87,43 @@ def calculate_zones_vectorized(df: pd.DataFrame, user_max_hr: int) -> pd.Series:
     
     base_zone = np.select(conditions, choices, default=4)
 
-    # 2. Variabilitäts-Index (VI) berechnen
-    # Vermeide Division durch Null
+    # 2. Variabilitäts-Index (VI)
     vi = np.where(avg_power > 10, norm_power / avg_power, 1.0)
     
-    # 3. Intelligente Upgrades (Vektorisiert)
-    # Logik: Wenn Puls-Spitzen oder hohe Variabilität (Intervalle), dann Zone hochstufen
-    
-    # Upgrade Regel 1: Hohe Max-HF -> Mindestens Z4 (Zone 3)
-    # (max_pct > 0.92) und (bisher < Z4) -> Upgrade auf Z4
+    # 3. Intelligente Upgrades
     upgrade_max_hr = (max_pct > 0.92) & (base_zone < 3)
     base_zone = np.where(upgrade_max_hr, 3, base_zone)
 
-    # Upgrade Regel 2: Sehr hoher VI -> Mindestens Z4
     upgrade_vi_high = (vi > 1.15) & (base_zone < 3)
     base_zone = np.where(upgrade_vi_high, 3, base_zone)
 
-    # Upgrade Regel 3: Moderater VI -> Mindestens Z3
     upgrade_vi_mod = (vi > 1.08) & (base_zone < 2)
     base_zone = np.where(upgrade_vi_mod, 2, base_zone)
 
     return pd.Series(base_zone, index=df.index).astype(int)
 
-# --- NEUE WISSENSCHAFTLICHE FUNKTIONEN (ADDITIV & KORRIGIERT) ---
+# --- NEUE WISSENSCHAFTLICHE FUNKTIONEN ---
 
 def calculate_pmc_stats(df: pd.DataFrame) -> pd.DataFrame:
     """
     Berechnet CTL, ATL und TSB für das Performance Management Chart.
-    Nutzt TRIMP (Stress) als Basis.
-    Scientific Fix: Nutzung von alpha=1/42 statt span=42.
+    Nutzt TRIMP (Stress) als Basis und Coggan-Zeitkonstanten.
     """
     if df.empty:
         return pd.DataFrame()
 
-    # 1. Resampling auf tägliche Basis (auffüllen fehlender Tage mit 0)
     daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
     
-    # 2. Berechnung EWMA (Exponential Weighted Moving Average)
-    # CTL = Fitness (42 Tage), ATL = Fatigue (7 Tage)
-    # Fix: Alpha statt Span für exakte Zeitkonstante nach Coggan
+    # Scientific Fix: Alpha statt Span für exakte Zeitkonstante
     daily['CTL'] = daily['Stress'].ewm(alpha=1/42, adjust=False).mean()
     daily['ATL'] = daily['Stress'].ewm(alpha=1/7, adjust=False).mean()
-    
-    # 3. TSB = Form (Training Stress Balance)
     daily['TSB'] = daily['CTL'] - daily['ATL']
     
     daily.reset_index(inplace=True)
     return daily
 
 def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[float, float, bool]:
-    """
-    Berechnet Monotonie und Strain nach Foster für die letzten X Tage.
-    Monotonie = Durchschnittl. täglicher Load / Standardabweichung.
-    Rückgabe: (Monotonie, Strain, Warnung_Flag)
-    """
+    """Berechnet Monotonie und Strain nach Foster."""
     if df.empty:
         return 0.0, 0.0, False
 
@@ -156,54 +134,45 @@ def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[f
     std_load = recent.std()
     
     if std_load == 0:
-        monotony = 0.0 # Vermeidung Div/0 bei nur einem Wert oder identischen Werten
+        monotony = 0.0
     else:
         monotony = avg_load / std_load
         
     strain = recent.sum() * monotony
-    
-    # Warnung wenn Monotonie > 2.0 (Gefahr von Overtraining/Stagnation)
-    warning = monotony > 2.0 and recent.sum() > 200 # Nur warnen wenn auch Last da ist
+    warning = monotony > 2.0 and recent.sum() > 200
     
     return round(monotony, 2), round(strain, 0), warning
 
-# --- DATEI-PARSER FÜR DEEP DIVE (MODIFIZIERT FÜR SPEED) ---
+# --- DATEI-PARSER FÜR DEEP DIVE ---
 
 def parse_tcx(file) -> pd.DataFrame:
-    """Parst eine .tcx Datei und extrahiert Sekunden-Daten inkl. Speed."""
+    """Parst eine .tcx Datei inkl. Speed für Moving Time."""
     try:
         tree = ET.parse(file)
         root = tree.getroot()
-        # TCX Namespace Handling ist oft tricky, wir versuchen es generisch
+        # Namespace Handling generic
         ns = {'ns': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'}
         
         data = []
         for trackpoint in root.findall('.//ns:Trackpoint', ns):
             point = {}
-            # Zeit
             time_elem = trackpoint.find('ns:Time', ns)
             if time_elem is not None:
                 point['timestamp'] = time_elem.text
             
-            # Herzfrequenz
             hr_elem = trackpoint.find('.//ns:HeartRateBpm/ns:Value', ns)
             if hr_elem is not None:
                 point['heart_rate'] = int(hr_elem.text)
                 
-            # Erweiterungen (Watt, Cadence) sind oft in Extensions
-            # Wir suchen einfach rekursiv nach Tags, da die Struktur variieren kann (TPX)
-            # Watt
             watts_elem = trackpoint.find('.//{*}Watts')
             if watts_elem is not None:
                 point['power'] = float(watts_elem.text)
             
-            # Cadence
             cad_elem = trackpoint.find('ns:Cadence', ns)
             if cad_elem is not None:
                 point['cadence'] = int(cad_elem.text)
-
-            # Speed (Extensions usually contain TPX)
-            # Nutze Wildcard {*}, um Namespace-Probleme zu umgehen
+            
+            # Speed from Extensions (TPX)
             for ext in trackpoint.findall('.//{*}TPX/{*}Speed'):
                 if ext is not None:
                     point['speed'] = float(ext.text)
@@ -241,26 +210,20 @@ def parse_fit(file) -> pd.DataFrame:
         return pd.DataFrame()
 
 def calculate_power_curve(df_stream: pd.DataFrame) -> pd.DataFrame:
-    """Berechnet die Mean Max Power Curve (MMP) für diverse Zeitfenster."""
+    """Berechnet die Mean Max Power Curve (MMP)."""
     if 'power' not in df_stream.columns or 'timestamp' not in df_stream.columns:
         return pd.DataFrame()
     
-    # BUGFIX: Entfernen doppelter Zeitstempel, bevor Resampling stattfindet
-    # "cannot reindex on an axis with duplicate labels"
     df_stream = df_stream.drop_duplicates(subset=['timestamp'], keep='first')
-
-    # Sicherstellen, dass wir Sekunden-Daten haben (Resample auf 1s)
     df_stream = df_stream.set_index('timestamp').resample('1S').ffill().reset_index()
     
-    windows = [1, 5, 10, 30, 60, 180, 300, 600, 1200, 3600] # Sekunden
+    windows = [1, 5, 10, 30, 60, 180, 300, 600, 1200, 3600]
     results = []
     
     series = df_stream['power']
-    
     for w in windows:
         if len(series) >= w:
             mmp = series.rolling(window=w).mean().max()
-            # FIX: Check auf NaN, bevor in int konvertiert wird
             if pd.notna(mmp):
                 results.append({'Dauer_Sek': w, 'Watt': int(mmp)})
             
@@ -268,48 +231,33 @@ def calculate_power_curve(df_stream: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_aerobic_decoupling(df_stream: pd.DataFrame) -> Tuple[float, float, float]:
     """
-    Berechnet die aerobe Entkopplung (Pw:HR) aka Aerobic Decoupling.
-    SCIENTIFIC FIX:
-    1. Nutzt Moving Time (Speed > 0.5 m/s) statt "Power > 0".
-       Grund: Rollphasen (Coasting) gehören zur physiologischen Einheit dazu.
-       Werden sie entfernt (wie vorher), wird die Efficiency künstlich stabilisiert.
-    2. Nutzt Average Power statt Normalized Power für das Ratio.
-       Grund: Bei hoher Variabilität (NP > Avg) und Cardiac Drift korreliert
-       Average Power besser mit der tatsächlichen physiologischen Entkopplung
-       (Referenz: Joe Friel Standard für lange Einheiten mit Pausen).
+    Berechnet Pw:HR (Aerobic Decoupling).
+    Logic: Moving Time (Speed > 0.5) & Average Power für Robustheit.
     """
-    # Validierung
     if 'power' not in df_stream.columns or 'heart_rate' not in df_stream.columns or 'timestamp' not in df_stream.columns:
         return 0.0, 0.0, 0.0
 
-    # 1. Kontinuierliche Zeitachse herstellen (wichtig für Gaps/Autopause)
     df = df_stream.drop_duplicates(subset=['timestamp'], keep='first').set_index('timestamp')
     df = df.resample('1S').asfreq().reset_index()
     
-    # Gaps füllen
     df['power'] = df['power'].fillna(0)
     df['heart_rate'] = df['heart_rate'].ffill()
     
-    # Speed für Moving Time Ermittlung
     if 'speed' in df.columns:
         df['speed'] = df['speed'].fillna(0)
     else:
-        # Fallback wenn kein Speed da (z.B. Indoor ohne Virtual Speed): Nehme Power > 0
         df['speed'] = np.where(df['power'] > 0, 1.0, 0.0)
 
-    # 2. Moving Time Filter (Standard: > 0.5 m/s oder ~1.8 km/h)
-    # Wir behalten Power=0 (Coasting), solange Speed > 0 ist!
+    # Moving Time Filter
     df_active = df[df['speed'] > 0.5].copy()
     
-    if len(df_active) < 600: # Minimum 10 Minuten Daten für sinnvolle Berechnung
+    if len(df_active) < 600:
         return 0.0, 0.0, 0.0
 
-    # Split in zwei Hälften der Moving Time
     midpoint = len(df_active) // 2
     p1 = df_active.iloc[:midpoint]
     p2 = df_active.iloc[midpoint:]
 
-    # Helper: Nutze Average Power für bessere Vergleichbarkeit bei Drift
     def get_ratio(sub_df):
         if len(sub_df) == 0: return 0
         avg_pwr = sub_df['power'].mean()
@@ -322,71 +270,45 @@ def calculate_aerobic_decoupling(df_stream: pd.DataFrame) -> Tuple[float, float,
 
     if ratio1 == 0: return 0.0, 0.0, 0.0
 
-    # Decoupling Berechnung: (Ratio1 - Ratio2) / Ratio1
-    # Wenn der Puls steigt (Drift) bei gleichen Watt (oder Watt stärker sinken als Puls),
-    # wird Ratio2 kleiner -> Decoupling positiv.
     decoupling = (ratio1 - ratio2) / ratio1 * 100
-
     return round(decoupling, 2), round(ratio1, 2), round(ratio2, 2)
 
-# --- CACHE MANAGEMENT (ROBUST) ---
+# --- CACHE MANAGEMENT ---
 
 def get_cache_filename(email: str) -> str:
-    """Erstellt einen sicheren, anonymen Dateinamen für den Cache basierend auf der E-Mail."""
-    if not email:
-        return "garmin_cache_unknown.pkl"
-    # E-Mail normalisieren und hashen
+    if not email: return "garmin_cache_unknown.pkl"
     email_hash = hashlib.sha256(email.strip().lower().encode('utf-8')).hexdigest()
     return f"garmin_cache_{email_hash}.pkl"
 
 def load_local_cache(email: str) -> List[Dict]:
-    """Lädt die lokalen Rohdaten für den spezifischen Nutzer, falls vorhanden."""
     cache_file = get_cache_filename(email)
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "rb") as f:
                 data = pickle.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            pass # Korrupter Cache oder Fehler
+                if isinstance(data, list): return data
+        except Exception: pass
     return []
 
 def save_local_cache(data: List[Dict], email: str):
-    """Speichert Rohdaten binär für den spezifischen Nutzer."""
-    cache_file = get_cache_filename(email)
     try:
-        with open(cache_file, "wb") as f:
-            pickle.dump(data, f)
-    except Exception as e:
-        print(f"Cache Save Error: {e}")
+        with open(get_cache_filename(email), "wb") as f: pickle.dump(data, f)
+    except Exception as e: print(f"Cache Save Error: {e}")
 
 def get_latest_activity_date(activities: List[Dict]) -> Optional[datetime.date]:
-    """Findet das Datum der letzten Aktivität im Cache."""
-    if not activities:
-        return None
+    if not activities: return None
     try:
-        # Robustes Parsen der Startzeiten
         dates = [act.get('startTimeLocal', '1970-01-01 00:00:00') for act in activities]
         max_date_str = max(dates)
         return datetime.datetime.strptime(max_date_str.split(' ')[0], "%Y-%m-%d").date()
-    except Exception:
-        return None
+    except Exception: return None
 
 def merge_activities(old_data: List[Dict], new_data: List[Dict]) -> List[Dict]:
-    """Upsert-Strategie basierend auf activityId."""
-    if not old_data and not new_data:
-        return []
-    
+    if not old_data and not new_data: return []
     data_map = {act.get('activityId'): act for act in old_data if act.get('activityId')}
-    
     for act in new_data:
-        aid = act.get('activityId')
-        if aid:
-            data_map[aid] = act # Überschreibt existierende IDs (Update)
-            
+        if act.get('activityId'): data_map[act.get('activityId')] = act
     merged_list = list(data_map.values())
-    # Sortierung nach Datum wichtig für ACWR Rolling Calculation
     merged_list.sort(key=lambda x: x.get('startTimeLocal', ''))
     return merged_list
 
@@ -394,17 +316,10 @@ def merge_activities(old_data: List[Dict], new_data: List[Dict]) -> List[Dict]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_garmin_raw(email: str, password: str, start_date_str: str, end_date_str: str) -> Tuple[List[Dict], Optional[str]]:
-    """
-    Verbindet mit Garmin Connect.
-    NOTE: Wir übergeben Strings statt date-Objekte, damit st.cache_data besser hasht.
-    """
     try:
         client = Garmin(email, password)
         client.login()
-        
-        # WICHTIG: activity_type=None holt alle Typen. "" kann manchmal filtern.
         activities = client.get_activities_by_date(start_date_str, end_date_str, None)
-        
         return activities, None
     except Exception as e:
         return [], str(e)
@@ -463,6 +378,36 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
         if row['NormPower'] is None and row['Leistung'] is not None:
             row['NormPower'] = row['Leistung']
 
+        # --- SENSOR INTEGRITY CHECK (ROBUST V3) ---
+        # 1. Daten extrahieren und Nullen absichern
+        hf_val = row.get('HF') or 0
+        pwr_val = row.get('Leistung') or 0
+        np_val = row.get('NormPower') or 0
+        
+        is_sensor_fail = False
+        
+        # Nur prüfen, wenn überhaupt Puls da ist (Training stattgefunden)
+        if hf_val > 90 and pwr_val > 0:
+            # 1. Hard Cutoff: Arbeitspuls (>105) aber Roll-Leistung (<75W)
+            if hf_val > 105 and pwr_val < 75:
+                is_sensor_fail = True
+            
+            # 2. Ratio Check (Efficiency): W/bpm < 0.55 ist extrem verdächtig
+            raw_ef = pwr_val / hf_val
+            if raw_ef < 0.55:
+                is_sensor_fail = True
+                
+            # 3. Variability Check: Geisterdaten sind oft Spikes + Nullen
+            if pwr_val > 0 and (np_val / pwr_val) > 1.5 and pwr_val < 100:
+                is_sensor_fail = True
+        
+        if is_sensor_fail:
+            # WICHTIG: Setze auf 0. Wir filtern die 0 später für die Charts raus.
+            row['Leistung'] = 0
+            row['NormPower'] = 0
+            row['Max20Min'] = 0
+            row['Aktivität'] = f"{row['Aktivität']} [Sensor-Fix]"
+
         extracted_data.append(row)
 
     if not extracted_data:
@@ -481,9 +426,11 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
     df['Dauer_Min'] = (df['Dauer_Sec'] / 60).round(1)
     df['Distanz'] = (df['Distanz_Raw'] / 1000).round(1)
     
+    # Validitäts-Maske:
+    # WICHTIG: Wir behalten Zeilen, die Puls HABEN, auch wenn Leistung=0 (Sensor-Fail oder kein PM)
     mask_valid = (
         (df['HF'] > 0) & 
-        ((df['Leistung'] > 40) | (df['NormPower'] > 40)) & 
+        ((df['Leistung'] > 0) | (df['NormPower'] > 0) | (df['HF'] > 0)) & 
         (df['Dauer_Min'] > 5)
     )
     df = df[mask_valid].copy()
@@ -493,8 +440,10 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
 
     # --- WISSENSCHAFTLICHE BERECHNUNGEN ---
     df['Stress'] = calculate_trimp_vectorized(df['Dauer_Min'], df['HF'], user_max_hr).round(1)
-    df['EF'] = np.where(df['HF'] > 0, df['NormPower'] / df['HF'], 0)
+    # EF nur berechnen, wenn Power valide ist
+    df['EF'] = np.where((df['HF'] > 0) & (df['NormPower'] > 0), df['NormPower'] / df['HF'], 0)
     df['EF'] = df['EF'].round(2)
+    
     df['ZoneIdx'] = calculate_zones_vectorized(df, user_max_hr)
     
     zone_labels = {0: "Z1 (Erholung)", 1: "Z2 (Grundlage)", 2: "Z3 (Tempo)", 3: "Z4 (Schwelle)", 4: "Z5 (Max)"}
@@ -511,7 +460,7 @@ def generate_demo_data(days: int = 120, user_max_hr: int = 161) -> pd.DataFrame:
     random.seed(42)
     data = []
     today = datetime.date.today()
-    total_days = days + 45 # Buffer erhöht
+    total_days = days + 45 
     
     for i in range(total_days):
         if random.random() > 0.6: continue 
@@ -678,10 +627,10 @@ with st.sidebar:
             elif monotony > 1.5:
                 st.warning(f"ℹ️ **Hohe Monotonie ({monotony}):** Variiere Intensität mehr.")
 
-st.title("🚴 Garmin Science Lab V16 (Deep Dive Edition)")
+st.title("🚴 Garmin Science Lab V16.6 (Fix ACWR & Trends)")
 st.markdown("Analyse von **Effizienz**, **Belastung (PMC/ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
-# --- WISSENSCHAFTLICHER GUIDE (MASTERCLASS) ---
+# --- WISSENSCHAFTLICHER GUIDE ---
 with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Masterclass)", expanded=False):
     st.markdown("""
     ### 🎓 Dein Labor-Handbuch
@@ -1067,35 +1016,49 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                                 else: st.info("➡️ **Plateau:** Deine aerobe Effizienz ist im gewählten Zeitraum stabil geblieben.")
             else: st.warning("Zu wenig Daten für einen Phasen-Vergleich.")
 
-        # TAB 3: ACWR
+        # TAB 3: ACWR (Fix: Berechnung auf Full History, dann Filter)
         with tab3:
+            # FIX: ACWR Berechnung muss auf der VOLLEN Historie basieren (Rolling 28d)
             daily = df_full_history.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
             daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
             daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
             daily['ACWR'] = np.where(daily['Chronic'] > 0, daily['Acute'] / daily['Chronic'], 0)
             daily.reset_index(inplace=True)
+            
+            # Erst JETZT filtern für die Ansicht
             daily_view = daily[(daily['Datum'].dt.date >= start_date) & (daily['Datum'].dt.date <= end_date)].copy()
 
-            base = alt.Chart(daily_view).encode(x='Datum')
-            line = base.mark_line(color='#10b981').encode(y='ACWR')
-            points = base.mark_circle().encode(
-                y='ACWR', color=alt.condition(alt.datum.ACWR > 1.5, alt.value('red'), alt.value('#10b981')),
-                tooltip=['Datum', alt.Tooltip('ACWR', format='.2f')]
-            )
-            danger = alt.Chart(pd.DataFrame({'y': [1.5]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
-            st.altair_chart(line + points + danger, width="stretch")
-            
             if not daily_view.empty:
+                base = alt.Chart(daily_view).encode(x='Datum')
+                line = base.mark_line(color='#10b981').encode(y='ACWR')
+                points = base.mark_circle().encode(
+                    y='ACWR', color=alt.condition(alt.datum.ACWR > 1.5, alt.value('red'), alt.value('#10b981')),
+                    tooltip=['Datum', alt.Tooltip('ACWR', format='.2f')]
+                )
+                danger = alt.Chart(pd.DataFrame({'y': [1.5]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
+                st.altair_chart(line + points + danger, width="stretch")
+                
                 curr = daily_view.iloc[-1]['ACWR']
                 if curr > 1.5: st.error(f"⚠️ **ACWR High ({curr:.2f}):** Verletzungsrisiko erhöht! Belastung reduzieren.")
                 elif curr < 0.8: st.warning(f"📉 **ACWR Low ({curr:.2f}):** Detraining möglich. Intensität/Volumen steigern.")
                 else: st.success(f"✅ **ACWR Optimal ({curr:.2f}):** Sweet Spot Training.")
+            else:
+                st.warning("Keine Daten für ACWR im gewählten Zeitraum.")
 
-        # TAB 4: TRENDS
+        # TAB 4: TRENDS (Fix: NaN Aggregation)
         with tab4:
-            daily_agg = df_view.set_index('Datum').resample('D').agg({
-                'Stress': 'sum', 'Dauer_Min': 'sum', 'Leistung': 'mean', 'HF': 'mean', 'EF': 'mean' 
-            }).fillna(0).reset_index()
+            # FIX: Kopie erstellen und 0-Werte in NaN umwandeln für korrekte Mittelwerte
+            # Damit werden "0 Watt" Tage (Sensor-Fix oder keine Daten) im Chart ignoriert (Lücke) statt als 0 gezeichnet
+            df_trend = df_view.copy()
+            for c in ['Leistung', 'HF', 'EF']:
+                df_trend[c] = df_trend[c].replace(0, np.nan)
+            
+            # Getrennte Aggregation: Summen vs. Mittelwerte
+            daily_sums = df_trend.set_index('Datum').resample('D')[['Stress', 'Dauer_Min']].sum()
+            daily_means = df_trend.set_index('Datum').resample('D')[['Leistung', 'HF', 'EF']].mean()
+            
+            # Zusammenführen
+            daily_agg = pd.concat([daily_sums, daily_means], axis=1).reset_index()
             
             base = alt.Chart(daily_agg).encode(x='Datum')
             bar = base.mark_bar(opacity=0.3, color='purple').encode(y='Stress', tooltip='Stress')
@@ -1103,7 +1066,10 @@ if st.session_state.df is not None and not st.session_state.df.empty:
             st.altair_chart(alt.layer(bar, line).resolve_scale(y='independent'), width="stretch")
             
             ef_data = daily_agg[daily_agg['EF'] > 0].copy()
-            ef_data['EF_MA'] = ef_data['EF'].rolling(window=5, min_periods=1).mean()
+            # Moving Average nur berechnen wenn genug Daten da sind
+            if len(ef_data) > 1:
+                ef_data['EF_MA'] = ef_data['EF'].rolling(window=5, min_periods=1).mean()
+                
             if not ef_data.empty:
                 chart_ef = alt.Chart(ef_data).mark_circle(color='green').encode(x='Datum', y=alt.Y('EF', scale=alt.Scale(zero=False))) + \
                            alt.Chart(ef_data).mark_line(color='green').encode(x='Datum', y='EF_MA')
