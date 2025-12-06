@@ -114,7 +114,7 @@ def calculate_pmc_stats(df: pd.DataFrame) -> pd.DataFrame:
 
     daily = df.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
     
-    # Scientific Fix: Alpha statt Span für exakte Zeitkonstante
+    # Scientific Fix: Alpha statt Span für exakte Zeitkonstante (Coggan Tau=42 -> Alpha=1/42)
     daily['CTL'] = daily['Stress'].ewm(alpha=1/42, adjust=False).mean()
     daily['ATL'] = daily['Stress'].ewm(alpha=1/7, adjust=False).mean()
     daily['TSB'] = daily['CTL'] - daily['ATL']
@@ -378,7 +378,7 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
         if row['NormPower'] is None and row['Leistung'] is not None:
             row['NormPower'] = row['Leistung']
 
-        # --- SENSOR INTEGRITY CHECK (ROBUST V3) ---
+        # --- SENSOR INTEGRITY CHECK (ROBUST V3 - SCIENTIFIC FIX) ---
         # 1. Daten extrahieren und Nullen absichern
         hf_val = row.get('HF') or 0
         pwr_val = row.get('Leistung') or 0
@@ -388,13 +388,14 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
         
         # Nur prüfen, wenn überhaupt Puls da ist (Training stattgefunden)
         if hf_val > 90 and pwr_val > 0:
-            # 1. Hard Cutoff: Arbeitspuls (>105) aber Roll-Leistung (<75W)
-            if hf_val > 105 and pwr_val < 75:
+            # 1. Hard Cutoff: Arbeitspuls (>105) aber Leistung extrem gering (<30W)
+            # FIX: Erhöht Toleranz für leichte Fahrer/Recovery (vorher 75W, jetzt 30W)
+            if hf_val > 105 and pwr_val < 30:
                 is_sensor_fail = True
             
-            # 2. Ratio Check (Efficiency): W/bpm < 0.55 ist extrem verdächtig
+            # 2. Ratio Check (Efficiency): W/bpm < 0.55 ist extrem verdächtig (bleibt)
             raw_ef = pwr_val / hf_val
-            if raw_ef < 0.55:
+            if raw_ef < 0.55 and pwr_val > 50: # Check nur über 50W relevant
                 is_sensor_fail = True
                 
             # 3. Variability Check: Geisterdaten sind oft Spikes + Nullen
@@ -627,7 +628,7 @@ with st.sidebar:
             elif monotony > 1.5:
                 st.warning(f"ℹ️ **Hohe Monotonie ({monotony}):** Variiere Intensität mehr.")
 
-st.title("🚴 Garmin Science Lab V16.6 (Fix ACWR & Trends)")
+st.title("🚴 Garmin Science Lab V16.7 (Review Fixed)")
 st.markdown("Analyse von **Effizienz**, **Belastung (PMC/ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
 # --- WISSENSCHAFTLICHER GUIDE ---
@@ -1021,7 +1022,8 @@ if st.session_state.df is not None and not st.session_state.df.empty:
             # FIX: ACWR Berechnung muss auf der VOLLEN Historie basieren (Rolling 28d)
             daily = df_full_history.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
             daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
-            daily['Chronic'] = daily['Stress'].rolling(28, min_periods=1).mean()
+            # FIX Scientific: Chronic Load braucht min 7 Tage Vorlauf um "Start-Artefakte" (ACWR=1) zu vermeiden
+            daily['Chronic'] = daily['Stress'].rolling(28, min_periods=7).mean()
             daily['ACWR'] = np.where(daily['Chronic'] > 0, daily['Acute'] / daily['Chronic'], 0)
             daily.reset_index(inplace=True)
             
@@ -1075,7 +1077,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                            alt.Chart(ef_data).mark_line(color='green').encode(x='Datum', y='EF_MA')
                 st.altair_chart(chart_ef, width="stretch")
 
-        # TAB 5: ZONEN-OPTIMIERER
+        # TAB 5: ZONEN-OPTIMIERER (SCIENTIFIC FIX: DURATION BASED)
         with tab5:
             max_date = df_view['Datum'].max()
             start_analysis = max_date - datetime.timedelta(weeks=comparison_weeks)
@@ -1097,15 +1099,20 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                 c2.metric("Empfohlenes Modell", mod)
                 st.info(msg)
                 
-                counts = df_recent['ZoneIdx'].value_counts().sort_index()
-                total_count = len(df_recent)
+                # FIX: Berechnung auf Zeitbasis (Dauer_Min) statt Anzahl der Einheiten
+                total_duration = df_recent['Dauer_Min'].sum()
+                zone_durations = df_recent.groupby('ZoneIdx')['Dauer_Min'].sum()
+                
                 labels = ["Z1", "Z2", "Z3", "Z4", "Z5"]
                 
                 cols = st.columns(5)
                 comp_data = []
                 
                 for i in range(5):
-                    act_pct = (counts.get(i, 0) / total_count * 100) if total_count > 0 else 0
+                    # FIX: Nutzung von Duration Sum statt count()
+                    dur_val = zone_durations.get(i, 0)
+                    act_pct = (dur_val / total_duration * 100) if total_duration > 0 else 0
+                    
                     delta = act_pct - targets[i]
                     with cols[i]:
                         st.metric(labels[i], f"{int(act_pct)}%", f"{int(delta)}% vs Soll", delta_color="inverse")
@@ -1116,6 +1123,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                     x=alt.X('Zone', sort=labels), y='Prozent', color='Typ', xOffset='Typ', tooltip=['Zone', 'Typ', alt.Tooltip('Prozent', format='.1f')]
                 )
                 st.altair_chart(chart, width="stretch")
+                st.caption("Berechnung basiert auf 'Time in Zone' (Dauer der Einheiten), nicht Anzahl der Trainings.")
             else:
                 st.warning("Zu wenig Daten im gewählten Zeitraum für eine zuverlässige Zonen-Analyse.")
         
@@ -1146,7 +1154,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                         max_pwr = df_stream['power'].max()
                         avg_pwr = df_stream['power'].mean()
                         
-                        # Neue Funktion: Aerobe Entkopplung (KORRIGIERT)
+                        # Neue Funktion: Aerobe Entkopplung
                         decoupling, ef1, ef2 = calculate_aerobic_decoupling(df_stream)
                         
                         # --- Layout ---
