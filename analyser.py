@@ -5,6 +5,7 @@ import random
 import pickle
 import hashlib
 from typing import List, Optional, Tuple, Dict, Any
+import xml.etree.ElementTree as ET 
 
 import streamlit as st
 from streamlit.web import cli as stcli
@@ -14,6 +15,13 @@ import pandas as pd
 import altair as alt
 import numpy as np
 from garminconnect import Garmin
+
+# Versuch, fitparse zu importieren (für .fit Dateien)
+try:
+    import fitparse
+    FITPARSE_AVAILABLE = True
+except ImportError:
+    FITPARSE_AVAILABLE = False
 
 # --- KONSTANTEN ---
 # CACHE_FILE = "garmin_cache.pkl" # Deprecated: Now dynamic per user
@@ -33,12 +41,13 @@ try:
 except Exception:
     pass
 
-# --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC - UNVERÄNDERT) ---
+# --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC - KORRIGIERT) ---
 
 def calculate_trimp_vectorized(duration_min: pd.Series, avg_hr: pd.Series, max_hr_user: int) -> pd.Series:
     """
     Berechnet den TRIMP (Training Impulse) nach Banister (Vektorisiert).
-    Formel: Dauer(min) * Intensität * exp(1.92 * Intensität)
+    Formel: Dauer(min) * Intensität * 0.64 * exp(1.92 * Intensität)
+    Scientific Fix: Faktor 0.64 (für Männer Standard) hinzugefügt.
     """
     if max_hr_user <= 0:
         return pd.Series(0.0, index=duration_min.index)
@@ -48,7 +57,8 @@ def calculate_trimp_vectorized(duration_min: pd.Series, avg_hr: pd.Series, max_h
     intensity = intensity.fillna(0).clip(lower=0)
     
     # Banister Gewichtungsfaktor (1.92 für Männer, 1.67 für Frauen - hier Default 1.92)
-    weighting = np.exp(1.92 * intensity)
+    # Fix: Faktor 0.64 ergänzt für korrekte Skalierung
+    weighting = 0.64 * np.exp(1.92 * intensity)
     
     return duration_min * intensity * weighting
 
@@ -104,12 +114,13 @@ def calculate_zones_vectorized(df: pd.DataFrame, user_max_hr: int) -> pd.Series:
 
     return pd.Series(base_zone, index=df.index).astype(int)
 
-# --- NEUE WISSENSCHAFTLICHE FUNKTIONEN (ADDITIV) ---
+# --- NEUE WISSENSCHAFTLICHE FUNKTIONEN (ADDITIV & KORRIGIERT) ---
 
 def calculate_pmc_stats(df: pd.DataFrame) -> pd.DataFrame:
     """
     Berechnet CTL, ATL und TSB für das Performance Management Chart.
     Nutzt TRIMP (Stress) als Basis.
+    Scientific Fix: Nutzung von alpha=1/42 statt span=42.
     """
     if df.empty:
         return pd.DataFrame()
@@ -119,8 +130,9 @@ def calculate_pmc_stats(df: pd.DataFrame) -> pd.DataFrame:
     
     # 2. Berechnung EWMA (Exponential Weighted Moving Average)
     # CTL = Fitness (42 Tage), ATL = Fatigue (7 Tage)
-    daily['CTL'] = daily['Stress'].ewm(span=42, adjust=False).mean()
-    daily['ATL'] = daily['Stress'].ewm(span=7, adjust=False).mean()
+    # Fix: Alpha statt Span für exakte Zeitkonstante nach Coggan
+    daily['CTL'] = daily['Stress'].ewm(alpha=1/42, adjust=False).mean()
+    daily['ATL'] = daily['Stress'].ewm(alpha=1/7, adjust=False).mean()
     
     # 3. TSB = Form (Training Stress Balance)
     daily['TSB'] = daily['CTL'] - daily['ATL']
@@ -154,6 +166,168 @@ def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[f
     warning = monotony > 2.0 and recent.sum() > 200 # Nur warnen wenn auch Last da ist
     
     return round(monotony, 2), round(strain, 0), warning
+
+# --- DATEI-PARSER FÜR DEEP DIVE (MODIFIZIERT FÜR SPEED) ---
+
+def parse_tcx(file) -> pd.DataFrame:
+    """Parst eine .tcx Datei und extrahiert Sekunden-Daten inkl. Speed."""
+    try:
+        tree = ET.parse(file)
+        root = tree.getroot()
+        # TCX Namespace Handling ist oft tricky, wir versuchen es generisch
+        ns = {'ns': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'}
+        
+        data = []
+        for trackpoint in root.findall('.//ns:Trackpoint', ns):
+            point = {}
+            # Zeit
+            time_elem = trackpoint.find('ns:Time', ns)
+            if time_elem is not None:
+                point['timestamp'] = time_elem.text
+            
+            # Herzfrequenz
+            hr_elem = trackpoint.find('.//ns:HeartRateBpm/ns:Value', ns)
+            if hr_elem is not None:
+                point['heart_rate'] = int(hr_elem.text)
+                
+            # Erweiterungen (Watt, Cadence) sind oft in Extensions
+            # Wir suchen einfach rekursiv nach Tags, da die Struktur variieren kann (TPX)
+            # Watt
+            watts_elem = trackpoint.find('.//{*}Watts')
+            if watts_elem is not None:
+                point['power'] = float(watts_elem.text)
+            
+            # Cadence
+            cad_elem = trackpoint.find('ns:Cadence', ns)
+            if cad_elem is not None:
+                point['cadence'] = int(cad_elem.text)
+
+            # Speed (Extensions usually contain TPX)
+            # Nutze Wildcard {*}, um Namespace-Probleme zu umgehen
+            for ext in trackpoint.findall('.//{*}TPX/{*}Speed'):
+                if ext is not None:
+                    point['speed'] = float(ext.text)
+            
+            data.append(point)
+            
+        df = pd.DataFrame(data)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Fehler beim Parsen der TCX: {e}")
+        return pd.DataFrame()
+
+def parse_fit(file) -> pd.DataFrame:
+    """Parst eine .fit Datei mittels fitparse."""
+    if not FITPARSE_AVAILABLE:
+        st.error("Bibliothek 'fitparse' fehlt. Bitte `pip install fitparse` ausführen.")
+        return pd.DataFrame()
+    
+    try:
+        fitfile = fitparse.FitFile(file)
+        data = []
+        for record in fitfile.get_messages("record"):
+            row = {}
+            for field in record:
+                if field.name in ['timestamp', 'heart_rate', 'power', 'cadence', 'speed', 'altitude']:
+                    row[field.name] = field.value
+            data.append(row)
+        
+        df = pd.DataFrame(data)
+        return df
+    except Exception as e:
+        st.error(f"Fehler beim Parsen der FIT: {e}")
+        return pd.DataFrame()
+
+def calculate_power_curve(df_stream: pd.DataFrame) -> pd.DataFrame:
+    """Berechnet die Mean Max Power Curve (MMP) für diverse Zeitfenster."""
+    if 'power' not in df_stream.columns or 'timestamp' not in df_stream.columns:
+        return pd.DataFrame()
+    
+    # BUGFIX: Entfernen doppelter Zeitstempel, bevor Resampling stattfindet
+    # "cannot reindex on an axis with duplicate labels"
+    df_stream = df_stream.drop_duplicates(subset=['timestamp'], keep='first')
+
+    # Sicherstellen, dass wir Sekunden-Daten haben (Resample auf 1s)
+    df_stream = df_stream.set_index('timestamp').resample('1S').ffill().reset_index()
+    
+    windows = [1, 5, 10, 30, 60, 180, 300, 600, 1200, 3600] # Sekunden
+    results = []
+    
+    series = df_stream['power']
+    
+    for w in windows:
+        if len(series) >= w:
+            mmp = series.rolling(window=w).mean().max()
+            # FIX: Check auf NaN, bevor in int konvertiert wird
+            if pd.notna(mmp):
+                results.append({'Dauer_Sek': w, 'Watt': int(mmp)})
+            
+    return pd.DataFrame(results)
+
+def calculate_aerobic_decoupling(df_stream: pd.DataFrame) -> Tuple[float, float, float]:
+    """
+    Berechnet die aerobe Entkopplung (Pw:HR) aka Aerobic Decoupling.
+    SCIENTIFIC FIX:
+    1. Nutzt Moving Time (Speed > 0.5 m/s) statt "Power > 0".
+       Grund: Rollphasen (Coasting) gehören zur physiologischen Einheit dazu.
+       Werden sie entfernt (wie vorher), wird die Efficiency künstlich stabilisiert.
+    2. Nutzt Average Power statt Normalized Power für das Ratio.
+       Grund: Bei hoher Variabilität (NP > Avg) und Cardiac Drift korreliert
+       Average Power besser mit der tatsächlichen physiologischen Entkopplung
+       (Referenz: Joe Friel Standard für lange Einheiten mit Pausen).
+    """
+    # Validierung
+    if 'power' not in df_stream.columns or 'heart_rate' not in df_stream.columns or 'timestamp' not in df_stream.columns:
+        return 0.0, 0.0, 0.0
+
+    # 1. Kontinuierliche Zeitachse herstellen (wichtig für Gaps/Autopause)
+    df = df_stream.drop_duplicates(subset=['timestamp'], keep='first').set_index('timestamp')
+    df = df.resample('1S').asfreq().reset_index()
+    
+    # Gaps füllen
+    df['power'] = df['power'].fillna(0)
+    df['heart_rate'] = df['heart_rate'].ffill()
+    
+    # Speed für Moving Time Ermittlung
+    if 'speed' in df.columns:
+        df['speed'] = df['speed'].fillna(0)
+    else:
+        # Fallback wenn kein Speed da (z.B. Indoor ohne Virtual Speed): Nehme Power > 0
+        df['speed'] = np.where(df['power'] > 0, 1.0, 0.0)
+
+    # 2. Moving Time Filter (Standard: > 0.5 m/s oder ~1.8 km/h)
+    # Wir behalten Power=0 (Coasting), solange Speed > 0 ist!
+    df_active = df[df['speed'] > 0.5].copy()
+    
+    if len(df_active) < 600: # Minimum 10 Minuten Daten für sinnvolle Berechnung
+        return 0.0, 0.0, 0.0
+
+    # Split in zwei Hälften der Moving Time
+    midpoint = len(df_active) // 2
+    p1 = df_active.iloc[:midpoint]
+    p2 = df_active.iloc[midpoint:]
+
+    # Helper: Nutze Average Power für bessere Vergleichbarkeit bei Drift
+    def get_ratio(sub_df):
+        if len(sub_df) == 0: return 0
+        avg_pwr = sub_df['power'].mean()
+        avg_hr = sub_df['heart_rate'].mean()
+        if avg_hr == 0: return 0
+        return avg_pwr / avg_hr
+
+    ratio1 = get_ratio(p1)
+    ratio2 = get_ratio(p2)
+
+    if ratio1 == 0: return 0.0, 0.0, 0.0
+
+    # Decoupling Berechnung: (Ratio1 - Ratio2) / Ratio1
+    # Wenn der Puls steigt (Drift) bei gleichen Watt (oder Watt stärker sinken als Puls),
+    # wird Ratio2 kleiner -> Decoupling positiv.
+    decoupling = (ratio1 - ratio2) / ratio1 * 100
+
+    return round(decoupling, 2), round(ratio1, 2), round(ratio2, 2)
 
 # --- CACHE MANAGEMENT (ROBUST) ---
 
@@ -504,7 +678,7 @@ with st.sidebar:
             elif monotony > 1.5:
                 st.warning(f"ℹ️ **Hohe Monotonie ({monotony}):** Variiere Intensität mehr.")
 
-st.title("🚴 Garmin Science Lab V14 (Pro Edition)")
+st.title("🚴 Garmin Science Lab V16 (Deep Dive Edition)")
 st.markdown("Analyse von **Effizienz**, **Belastung (PMC/ACWR)** und **Wissenschaftlicher Trainingsverteilung**.")
 
 # --- WISSENSCHAFTLICHER GUIDE (MASTERCLASS) ---
@@ -515,7 +689,7 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
     Hier verstehst du, was die Metriken bedeuten und wie du sie zur Steuerung nutzt.
     """)
     
-    g_tab1, g_tab2, g_tab3, g_tab4, g_tab5 = st.tabs(["🧬 Physiologie & Effizienz (EF)", "⚖️ Belastungs-Steuerung (ACWR)", "🚀 PMC (Form)", "📈 Training Stress (TRIMP)", "🎯 Zonen-Modelle"])
+    g_tab1, g_tab2, g_tab3, g_tab4, g_tab5, g_tab6 = st.tabs(["🧬 Physiologie & Effizienz (EF)", "⚖️ Belastungs-Steuerung (ACWR)", "🚀 PMC (Form)", "📈 Training Stress (TRIMP)", "🎯 Zonen-Modelle", "🔬 Deep Dive Metriken"])
     
     with g_tab1:
         st.markdown("#### Der Efficiency Factor (EF)")
@@ -613,6 +787,60 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
             * **Philosophie:** Z3 (Tempo/Sweetspot) ist wertvoll, um zeiteffizient "Widerstandsfähigkeit" aufzubauen.
             * **Für wen:** Zeitbegrenzte Athleten (<8h/Woche).
             """)
+    
+    with g_tab6:
+        st.subheader("🔬 Deep Dive Metriken")
+        st.markdown("Hier analysieren wir Sekunden-Daten, die über Standard-Metriken hinausgehen.")
+        
+        gc1, gc2 = st.columns([1, 1])
+        
+        with gc1:
+            st.markdown("#### 1. Power Duration Curve (PDC)")
+            st.info("""
+            **Was es ist:** Die PDC zeigt deine maximale Leistung (Watt) für jede Zeitdauer (1s bis 60min).
+            
+            **Warum wichtig:**
+            * **Phänotyp:** Bist du Sprinter (steil links) oder Diesel (flach)?
+            * **Ermüdungsresistenz:** Wie lange kannst du hohe Leistung halten?
+            """)
+            
+            # Dummy Data für Example Chart
+            ex_pdc = pd.DataFrame({
+                'Seconds': [1, 5, 10, 30, 60, 300, 1200, 3600],
+                'Watts': [900, 800, 700, 500, 400, 300, 250, 220]
+            })
+            
+            ch_pdc = alt.Chart(ex_pdc).mark_line(point=True).encode(
+                x=alt.X('Seconds', scale=alt.Scale(type='log'), title='Dauer (Log)'),
+                y=alt.Y('Watts', title='Leistung (W)'),
+                tooltip=['Seconds', 'Watts']
+            ).properties(title="Beispiel: Typische PDC Kurve", height=200)
+            
+            st.altair_chart(ch_pdc, use_container_width=True)
+
+        with gc2:
+            st.markdown("#### 2. Quadrant Analysis & Decoupling")
+            st.info("""
+            **Aerobe Entkopplung (Pw:HR):**
+            Misst den Cardiac Drift. Wir teilen die Einheit in zwei Hälften. Wenn der Puls in der 2. Hälfte steigt (bei gleichen Watt), ist die Entkopplung hoch.
+            * **< 5%:** Exzellente Ausdauer.
+            * **> 5%:** Ermüdung setzt ein.
+            """)
+            
+            # Dummy Data für Quadrant Example
+            ex_quad = pd.DataFrame({
+                'Cadence': np.random.normal(85, 10, 100),
+                'Force': np.random.normal(200, 50, 100)
+            })
+            
+            ch_quad = alt.Chart(ex_quad).mark_circle(size=60, opacity=0.5).encode(
+                x=alt.X('Cadence', title='Trittfrequenz (rpm)'),
+                y=alt.Y('Force', title='Pedalkraft (N)'),
+                color=alt.value('orange')
+            ).properties(title="Beispiel: Quadrant Verteilung", height=200)
+            
+            st.altair_chart(ch_quad, use_container_width=True)
+
 
 # --- LOGIK EXECUTION ---
 
@@ -721,7 +949,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
         m4.metric("Kalorien", f"{int(df_view['Kalorien'].sum()):,} kcal".replace(",", "."), f"Ø {int(df_view['Kalorien'].sum()/weeks_in_view)} kcal/Woche")
 
         st.divider()
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 PMC & Form", "🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer"])
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🚀 PMC & Form", "🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer", "🔬 Labor-Deep-Dive"])
 
         # TAB 1: PMC (NEW FEATURE)
         with tab1:
@@ -924,6 +1152,110 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                 st.altair_chart(chart, width="stretch")
             else:
                 st.warning("Zu wenig Daten im gewählten Zeitraum für eine zuverlässige Zonen-Analyse.")
+        
+        # TAB 6: LABOR-DEEP-DIVE (NEU)
+        with tab6:
+            st.markdown("### 🔬 Labor Deep-Dive: Einzel-Analyse")
+            st.markdown("Lade hier eine einzelne `.fit` oder `.tcx` Datei hoch, um sekündliche Daten (Power Curve, Cadence, etc.) zu analysieren. Dies ermöglicht Einblicke, die über die Standard-API nicht möglich sind.")
+            
+            uploaded_file = st.file_uploader("Datei hochladen (.fit oder .tcx)", type=['fit', 'tcx'])
+            
+            if uploaded_file is not None:
+                with st.spinner("Analysiere Datei..."):
+                    if uploaded_file.name.endswith('.fit'):
+                        df_stream = parse_fit(uploaded_file)
+                    else:
+                        df_stream = parse_tcx(uploaded_file)
+                    
+                    if not df_stream.empty and 'power' in df_stream.columns:
+                        st.success(f"Datei erfolgreich geladen: {len(df_stream)} Datenpunkte.")
+                        
+                        # Relative Zeit für Plot berechnen
+                        if 'timestamp' in df_stream.columns:
+                            start_time = df_stream['timestamp'].min()
+                            df_stream['duration_min'] = (df_stream['timestamp'] - start_time).dt.total_seconds() / 60
+                        
+                        # Metriken berechnen
+                        pdc = calculate_power_curve(df_stream)
+                        max_pwr = df_stream['power'].max()
+                        avg_pwr = df_stream['power'].mean()
+                        
+                        # Neue Funktion: Aerobe Entkopplung (KORRIGIERT)
+                        decoupling, ef1, ef2 = calculate_aerobic_decoupling(df_stream)
+                        
+                        # --- Layout ---
+                        col_a, col_b = st.columns([2, 1])
+                        
+                        with col_a:
+                            st.subheader("Power Duration Curve (MMP)")
+                            if not pdc.empty:
+                                chart_pdc = alt.Chart(pdc).mark_line(point=True).encode(
+                                    x=alt.X('Dauer_Sek', scale=alt.Scale(type='log'), title='Dauer (Log Skala)'),
+                                    y=alt.Y('Watt', title='Leistung (W)'),
+                                    tooltip=['Dauer_Sek', 'Watt']
+                                ) # .interactive() entfernt (fixiert)
+                                st.altair_chart(chart_pdc, use_container_width=True)
+                                
+                                # Automatische Einordnung
+                                p1m = pdc[pdc['Dauer_Sek']==60]['Watt'].max() if 60 in pdc['Dauer_Sek'].values else 0
+                                p5m = pdc[pdc['Dauer_Sek']==300]['Watt'].max() if 300 in pdc['Dauer_Sek'].values else 0
+                                p20m = pdc[pdc['Dauer_Sek']==1200]['Watt'].max() if 1200 in pdc['Dauer_Sek'].values else 0
+                                
+                                insight_text = ""
+                                if p1m > p20m * 2.0:
+                                    insight_text = "**Typ:** Sprinter / Anaerob stark. Starker Abfall nach 1min."
+                                elif p20m > 0 and p5m < p20m * 1.15:
+                                    insight_text = "**Typ:** Zeitfahrer (Diesel). Sehr flache Kurve."
+                                else:
+                                    insight_text = "**Typ:** Allrounder."
+                                
+                                st.info(f"💡 **Erkenntnis:** {insight_text}\n\n*Max 1min:* {int(p1m)}W | *Max 5min:* {int(p5m)}W | *Max 20min:* {int(p20m)}W")
+
+                        with col_b:
+                            st.subheader("Aerobe Entkopplung (Pw:HR)")
+                            if decoupling != 0:
+                                delta_color = "normal"
+                                if decoupling < 5: 
+                                    st.success(f"✅ **{decoupling}%** (Top Ausdauer)")
+                                elif decoupling < 8:
+                                    st.warning(f"⚠️ **{decoupling}%** (Leichter Drift)")
+                                else:
+                                    st.error(f"❌ **{decoupling}%** (Starker Drift)")
+                                
+                                st.caption(f"EF 1. Hälfte: {ef1}")
+                                st.caption(f"EF 2. Hälfte: {ef2}")
+                            else:
+                                st.info("Zu wenig Daten für Pw:HR Berechnung")
+
+                            st.divider()
+                            st.subheader("Verteilung")
+                            st.metric("Max Power", f"{int(max_pwr)} W")
+                            st.metric("Ø Power", f"{int(avg_pwr)} W")
+                            
+                            if 'cadence' in df_stream.columns:
+                                chart_cad = alt.Chart(df_stream).mark_bar().encode(
+                                    x=alt.X('cadence', bin=alt.Bin(maxbins=20), title='Trittfrequenz'),
+                                    y='count()',
+                                    color=alt.value('orange')
+                                )
+                                st.altair_chart(chart_cad, use_container_width=True)
+                        
+                        # Scatter Plot: Power vs Heart Rate
+                        if 'heart_rate' in df_stream.columns and 'duration_min' in df_stream.columns:
+                            st.subheader("Interne vs. Externe Belastung (Puls vs. Watt)")
+                            chart_scatter = alt.Chart(df_stream).mark_circle(opacity=0.3, size=20).encode(
+                                x=alt.X('power', title='Leistung (Watt)'),
+                                y=alt.Y('heart_rate', title='Herz (bpm)'),
+                                color=alt.Color('duration_min', title='Zeit (min)'), # Relative Zeit statt Datum
+                                tooltip=['duration_min', 'power', 'heart_rate']
+                            ) # .interactive() entfernt (fixiert)
+                            st.altair_chart(chart_scatter, use_container_width=True)
+                            st.caption("Ein 'Ausfransen' der Kurve nach oben rechts oder eine Verschiebung über die Zeit zeigt Ermüdung/Decoupling.")
+
+                    elif df_stream.empty:
+                        st.warning("Konnte keine Daten parsen. Ist die Datei korrekt?")
+                    else:
+                        st.warning("Keine Leistungsdaten (Watt) in dieser Datei gefunden.")
 
 elif st.session_state.df is None and not start_btn and not demo_btn:
     st.info("👈 Bitte links starten.")

@@ -1,4 +1,6 @@
 streamlit
-garminconnect
 pandas
+numpy
 altair
+garminconnect
+fitparse
