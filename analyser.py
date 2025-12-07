@@ -1,9 +1,12 @@
 import sys
 import os
 import datetime
+import time
 import random
 import pickle
 import hashlib
+import zipfile
+import io
 from typing import List, Optional, Tuple, Dict, Any
 import xml.etree.ElementTree as ET 
 
@@ -27,6 +30,8 @@ except ImportError:
 # CACHE_FILE = "garmin_cache.pkl" # Deprecated: Now dynamic per user
 # Buffer für ACWR Berechnung (Chronic Load braucht 28 Tage Vorlauf + Puffer)
 ACWR_BUFFER_DAYS = 45 # Erhöht auf 45 für sicheren CTL Anlauf (42 Tage Span)
+STREAM_DB_FILE = "garmin_streams_db.pkl" # Separater Store für High-Res Daten
+RAW_FILES_DIR = "garmin_raw_files" # NEU: Ordner für physische FIT/TCX Dateien
 
 # --- 1. AUTOMATISCHER STARTER ---
 if __name__ == "__main__":
@@ -40,6 +45,10 @@ try:
     st.set_page_config(page_title="Garmin Pro Analytics", page_icon="🚴", layout="wide")
 except Exception:
     pass
+
+# Erstelle Directory für Raw Files falls nicht existent
+if not os.path.exists(RAW_FILES_DIR):
+    os.makedirs(RAW_FILES_DIR)
 
 # --- WISSENSCHAFTLICHE BERECHNUNGEN (CORE LOGIC) ---
 
@@ -133,7 +142,7 @@ def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[f
     avg_load = recent.mean()
     std_load = recent.std()
     
-    if std_load == 0:
+    if std_load == 0 or pd.isna(std_load):
         monotony = 0.0
     else:
         monotony = avg_load / std_load
@@ -143,12 +152,17 @@ def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[f
     
     return round(monotony, 2), round(strain, 0), warning
 
-# --- DATEI-PARSER FÜR DEEP DIVE ---
+# --- DATEI-PARSER FÜR DEEP DIVE & MICRO CYCLE ---
 
 def parse_tcx(file) -> pd.DataFrame:
     """Parst eine .tcx Datei inkl. Speed für Moving Time."""
     try:
-        tree = ET.parse(file)
+        # Check if file is path string or file-like object
+        if isinstance(file, str):
+            tree = ET.parse(file)
+        else:
+            tree = ET.parse(file)
+            
         root = tree.getroot()
         # Namespace Handling generic
         ns = {'ns': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'}
@@ -184,7 +198,7 @@ def parse_tcx(file) -> pd.DataFrame:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
         return df
     except Exception as e:
-        st.error(f"Fehler beim Parsen der TCX: {e}")
+        # print(f"TCX Parse Error: {e}") 
         return pd.DataFrame()
 
 def parse_fit(file) -> pd.DataFrame:
@@ -206,7 +220,9 @@ def parse_fit(file) -> pd.DataFrame:
         df = pd.DataFrame(data)
         return df
     except Exception as e:
-        st.error(f"Fehler beim Parsen der FIT: {e}")
+        # st.error(f"Fehler beim Parsen der FIT: {e}") 
+        # Error unterdrücken für Batch-Verarbeitung, nur loggen
+        print(f"FIT Parse Error: {e}")
         return pd.DataFrame()
 
 def calculate_power_curve(df_stream: pd.DataFrame) -> pd.DataFrame:
@@ -215,7 +231,7 @@ def calculate_power_curve(df_stream: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     
     df_stream = df_stream.drop_duplicates(subset=['timestamp'], keep='first')
-    df_stream = df_stream.set_index('timestamp').resample('1S').ffill().reset_index()
+    df_stream = df_stream.set_index('timestamp').resample('1s').ffill().reset_index()
     
     windows = [1, 5, 10, 30, 60, 180, 300, 600, 1200, 3600]
     results = []
@@ -238,14 +254,19 @@ def calculate_aerobic_decoupling(df_stream: pd.DataFrame) -> Tuple[float, float,
         return 0.0, 0.0, 0.0
 
     df = df_stream.drop_duplicates(subset=['timestamp'], keep='first').set_index('timestamp')
-    df = df.resample('1S').asfreq().reset_index()
+    df = df.resample('1s').asfreq().reset_index()
     
-    df['power'] = df['power'].fillna(0)
-    df['heart_rate'] = df['heart_rate'].ffill()
+    # Fix: Typen erzwingen für Robustheit
+    df['power'] = pd.to_numeric(df['power'], errors='coerce').fillna(0)
+    df['heart_rate'] = pd.to_numeric(df['heart_rate'], errors='coerce').ffill()
     
+    # Speed Handling (Robust gegen Indoor/Trainer ohne Speed-Signal)
     if 'speed' in df.columns:
-        df['speed'] = df['speed'].fillna(0)
+        df['speed'] = pd.to_numeric(df['speed'], errors='coerce').fillna(0)
+        # Fix: Wenn Power vorhanden (>0), aber Speed 0 (z.B. Trainer), setzen wir Speed künstlich hoch
+        df['speed'] = np.where(df['power'] > 0, np.maximum(df['speed'], 1.0), df['speed'])
     else:
+        # Fallback wenn keine Speed-Spalte: Power als Indikator
         df['speed'] = np.where(df['power'] > 0, 1.0, 0.0)
 
     # Moving Time Filter
@@ -273,7 +294,7 @@ def calculate_aerobic_decoupling(df_stream: pd.DataFrame) -> Tuple[float, float,
     decoupling = (ratio1 - ratio2) / ratio1 * 100
     return round(decoupling, 2), round(ratio1, 2), round(ratio2, 2)
 
-# --- CACHE MANAGEMENT ---
+# --- CACHE MANAGEMENT (MAIN & STREAMS) ---
 
 def get_cache_filename(email: str) -> str:
     if not email: return "garmin_cache_unknown.pkl"
@@ -294,6 +315,23 @@ def save_local_cache(data: List[Dict], email: str):
     try:
         with open(get_cache_filename(email), "wb") as f: pickle.dump(data, f)
     except Exception as e: print(f"Cache Save Error: {e}")
+
+# --- NEU: STREAM DB MANAGEMENT (SEPARATED) ---
+def load_stream_db() -> Dict[str, pd.DataFrame]:
+    if os.path.exists(STREAM_DB_FILE):
+        try:
+            with open(STREAM_DB_FILE, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_stream_db(db: Dict[str, pd.DataFrame]):
+    try:
+        with open(STREAM_DB_FILE, "wb") as f:
+            pickle.dump(db, f)
+    except Exception as e:
+        print(f"Stream DB Save Error: {e}")
 
 def get_latest_activity_date(activities: List[Dict]) -> Optional[datetime.date]:
     if not activities: return None
@@ -323,6 +361,49 @@ def fetch_garmin_raw(email: str, password: str, start_date_str: str, end_date_st
         return activities, None
     except Exception as e:
         return [], str(e)
+
+# --- NEU: SICHERER DATEI-DOWNLOAD (ANTI-BAN STRATEGIE) ---
+def download_activity_safe(client, activity_id: int) -> Optional[str]:
+    """Lädt Aktivität sicher herunter, speichert sie lokal und gibt den Pfad zurück."""
+    
+    # 1. Prüfe ob Datei schon existiert (FIT oder TCX)
+    fit_path = os.path.join(RAW_FILES_DIR, f"{activity_id}.fit")
+    tcx_path = os.path.join(RAW_FILES_DIR, f"{activity_id}.tcx")
+    
+    if os.path.exists(fit_path): return fit_path
+    if os.path.exists(tcx_path): return tcx_path
+    
+    # 2. Download via API (Versuche Original/FIT)
+    try:
+        # Rate Limiting: Zufälliger Sleep um Ban zu vermeiden
+        time.sleep(random.uniform(2.5, 5.0))
+        
+        zip_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.ORIGINAL)
+        
+        # Versuche als ZIP zu entpacken
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_data), mode="r") as z:
+                for filename in z.namelist():
+                    if filename.lower().endswith(".fit"):
+                        with open(fit_path, "wb") as f:
+                            f.write(z.read(filename))
+                        return fit_path
+                    elif filename.lower().endswith(".tcx"):
+                        with open(tcx_path, "wb") as f:
+                            f.write(z.read(filename))
+                        return tcx_path
+        except zipfile.BadZipFile:
+            # Fallback: Vielleicht ist es direkt die Datei (passiert bei TCX requests manchmal)
+            # Wir nehmen an es könnte TCX sein, wenn Zip fehlschlägt
+            with open(tcx_path, "wb") as f:
+                f.write(zip_data)
+            return tcx_path
+            
+    except Exception as e:
+        print(f"Download Error {activity_id}: {e}")
+        return None
+    
+    return None
 
 def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.DataFrame:
     """Konvertiert Raw-Dicts in DataFrame und berechnet Metriken."""
@@ -599,6 +680,8 @@ with st.sidebar:
         if 'df' not in st.session_state: st.session_state.df = None
         if 'raw_data' not in st.session_state: st.session_state.raw_data = None
         if 'mode' not in st.session_state: st.session_state.mode = None 
+        # New State for Stream DB
+        if 'stream_db' not in st.session_state: st.session_state.stream_db = load_stream_db()
 
         days_diff = (end_date - start_date).days
         if st.session_state.df is not None and not st.session_state.df.empty:
@@ -766,7 +849,7 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
                 tooltip=['Seconds', 'Watts']
             ).properties(title="Beispiel: Typische PDC Kurve", height=200)
             
-            st.altair_chart(ch_pdc, use_container_width=True)
+            st.altair_chart(ch_pdc, width="stretch")
 
         with gc2:
             st.markdown("#### 2. Quadrant Analysis & Decoupling")
@@ -789,7 +872,7 @@ with st.expander("📘 Knowledge Base: Sportwissenschaftliche Hintergründe (Mas
                 color=alt.value('orange')
             ).properties(title="Beispiel: Quadrant Verteilung", height=200)
             
-            st.altair_chart(ch_quad, use_container_width=True)
+            st.altair_chart(ch_quad, width="stretch")
 
 
 # --- LOGIK EXECUTION ---
@@ -899,7 +982,10 @@ if st.session_state.df is not None and not st.session_state.df.empty:
         m4.metric("Kalorien", f"{int(df_view['Kalorien'].sum()):,} kcal".replace(",", "."), f"Ø {int(df_view['Kalorien'].sum()/weeks_in_view)} kcal/Woche")
 
         st.divider()
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🚀 PMC & Form", "🧬 Fitness-Shift", "⚖️ ACWR & Load", "📈 Trends", "🎨 Zonen-Optimierer", "🔬 Labor-Deep-Dive"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "🚀 PMC & Form", "🧬 Fitness-Shift", "⚖️ ACWR & Load", 
+            "📈 Trends", "🎨 Zonen-Optimierer", "🔬 Labor-Deep-Dive", "🧪 4-Wochen-Fokus"
+        ])
 
         # TAB 1: PMC (NEW FEATURE)
         with tab1:
@@ -935,7 +1021,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                         tsb_chart.properties(height=100, width="container")
                     ).resolve_scale(x='shared')
                     
-                    st.altair_chart(combined, use_container_width=True)
+                    st.altair_chart(combined, width="stretch")
                     
                     curr_tsb = df_pmc_view.iloc[-1]['TSB']
                     st.caption(f"Aktuelle Form (TSB): {curr_tsb:.1f}")
@@ -968,7 +1054,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                             tooltip=['Datum', 'Aktivität', power_col, 'HF']
                         )
                         lines = chart.transform_regression(power_col, 'HF', groupby=['Phase']).mark_line(size=3)
-                        st.altair_chart(chart + lines, use_container_width=True)
+                        st.altair_chart(chart + lines, width="stretch")
                     
                     with c2:
                         st.markdown("**True Aerobic Efficiency (Z2 > 60min)**")
@@ -995,7 +1081,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                             else:
                                 final_chart = base_chart
                                 
-                            st.altair_chart(final_chart, use_container_width=True)
+                            st.altair_chart(final_chart, width="stretch")
                             st.caption(f"Zeigt nur 'reine' Grundlageneinheiten ({len(df_z2_pure)}) ohne Intervalleinfluss.")
                         else:
                             st.info("Keine reinen Z2-Einheiten (>60min) gefunden.")
@@ -1127,7 +1213,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
             else:
                 st.warning("Zu wenig Daten im gewählten Zeitraum für eine zuverlässige Zonen-Analyse.")
         
-        # TAB 6: LABOR-DEEP-DIVE (NEU)
+        # TAB 6: LABOR-DEEP-DIVE (EXISTIEREND)
         with tab6:
             st.markdown("### 🔬 Labor Deep-Dive: Einzel-Analyse")
             st.markdown("Lade hier eine einzelne `.fit` oder `.tcx` Datei hoch, um sekündliche Daten (Power Curve, Cadence, etc.) zu analysieren. Dies ermöglicht Einblicke, die über die Standard-API nicht möglich sind.")
@@ -1168,7 +1254,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                                     y=alt.Y('Watt', title='Leistung (W)'),
                                     tooltip=['Dauer_Sek', 'Watt']
                                 ) # .interactive() entfernt (fixiert)
-                                st.altair_chart(chart_pdc, use_container_width=True)
+                                st.altair_chart(chart_pdc, width="stretch")
                                 
                                 # Automatische Einordnung
                                 p1m = pdc[pdc['Dauer_Sek']==60]['Watt'].max() if 60 in pdc['Dauer_Sek'].values else 0
@@ -1212,7 +1298,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                                     y='count()',
                                     color=alt.value('orange')
                                 )
-                                st.altair_chart(chart_cad, use_container_width=True)
+                                st.altair_chart(chart_cad, width="stretch")
                         
                         # Scatter Plot: Power vs Heart Rate
                         if 'heart_rate' in df_stream.columns and 'duration_min' in df_stream.columns:
@@ -1223,13 +1309,206 @@ if st.session_state.df is not None and not st.session_state.df.empty:
                                 color=alt.Color('duration_min', title='Zeit (min)'), # Relative Zeit statt Datum
                                 tooltip=['duration_min', 'power', 'heart_rate']
                             ) # .interactive() entfernt (fixiert)
-                            st.altair_chart(chart_scatter, use_container_width=True)
+                            st.altair_chart(chart_scatter, width="stretch")
                             st.caption("Ein 'Ausfransen' der Kurve nach oben rechts oder eine Verschiebung über die Zeit zeigt Ermüdung/Decoupling.")
 
                     elif df_stream.empty:
                         st.warning("Konnte keine Daten parsen. Ist die Datei korrekt?")
                     else:
                         st.warning("Keine Leistungsdaten (Watt) in dieser Datei gefunden.")
+
+        # --- NEW: TAB 7: 4-WOCHEN MICRO CYCLE ANALYZER (SMART SYNC) ---
+        with tab7:
+            st.markdown("### 🧪 4-Week Micro-Cycle Adaptation")
+            st.markdown("""
+            **Ziel:** Analyse kurzfristiger physiologischer Anpassungen mittels sekündlicher Daten.
+            **Anti-Ban Modus:** Dateien werden **langsam** und **gecacht** geladen.
+            """)
+            
+            # A) SYNC AREA
+            with st.expander("📥 Smart Sync (Garmin API)", expanded=True):
+                if st.session_state.mode == 'demo':
+                    st.warning("Smart Sync ist im Demo-Modus deaktiviert.")
+                else:
+                    # Filter: Nur Aktivitäten im gewählten Zeitraum
+                    # FIX: Hard-Cap auf 4 Wochen (Micro Cycle), egal was global eingestellt ist
+                    limit_date_micro = datetime.date.today() - datetime.timedelta(days=28)
+                    
+                    # Filtere df_view erneut strikt auf die letzten 28 Tage
+                    df_micro_sync = df_view[df_view['Datum'].dt.date >= limit_date_micro].copy()
+                    target_acts = df_micro_sync['ActivityID'].tolist()
+                    
+                    # Identifiziere fehlende Dateien
+                    missing_ids = []
+                    for aid in target_acts:
+                        f_path = os.path.join(RAW_FILES_DIR, f"{aid}.fit")
+                        t_path = os.path.join(RAW_FILES_DIR, f"{aid}.tcx")
+                        if not os.path.exists(f_path) and not os.path.exists(t_path):
+                            missing_ids.append(aid)
+                            
+                    st.info(f"Gefundene Aktivitäten im Zeitraum (Max 28 Tage): {len(target_acts)}. Davon noch nicht lokal gespeichert: **{len(missing_ids)}**")
+                    
+                    if missing_ids:
+                        if st.button(f"📥 Synchronisiere {len(missing_ids)} fehlende Dateien"):
+                            if not email or not password:
+                                st.error("Bitte Garmin-Login ausfüllen.")
+                            else:
+                                with st.status("Verbinde mit Garmin & lade Dateien...", expanded=True) as status:
+                                    try:
+                                        client = Garmin(email, password)
+                                        client.login()
+                                        
+                                        progress_bar = st.progress(0)
+                                        count_dl = 0
+                                        
+                                        for idx, aid in enumerate(missing_ids):
+                                            status.update(label=f"Lade Aktivität {idx+1}/{len(missing_ids)}...", state="running")
+                                            
+                                            f_path = download_activity_safe(client, aid)
+                                            
+                                            if f_path:
+                                                # Direkt in DB parsen
+                                                if f_path.endswith('.fit'):
+                                                    df_s = parse_fit(f_path)
+                                                else:
+                                                    df_s = parse_tcx(f_path)
+                                                    
+                                                if not df_s.empty and 'timestamp' in df_s.columns:
+                                                    # Unique ID erstellen
+                                                    start_ts = df_s['timestamp'].min()
+                                                    if pd.notna(start_ts):
+                                                        uid = str(start_ts.date()) + "_" + str(start_ts.hour)
+                                                        st.session_state.stream_db[uid] = df_s
+                                                        count_dl += 1
+                                            
+                                            progress_bar.progress((idx + 1) / len(missing_ids))
+                                        
+                                        save_stream_db(st.session_state.stream_db)
+                                        status.update(label=f"Fertig! {count_dl} neue Streams gespeichert.", state="complete")
+                                        st.rerun() # Refresh UI
+                                        
+                                    except Exception as e:
+                                        st.error(f"Verbindungsfehler: {e}")
+            
+            # B) ANALYSIS AREA
+            st.divider()
+            
+            # Convert Dict to List for Analysis
+            db_entries = []
+            for uid, df_s in st.session_state.stream_db.items():
+                if 'timestamp' not in df_s.columns: continue
+                # Basic Stats
+                t_date = df_s['timestamp'].min()
+                # Filter auf Range
+                if t_date.date() >= start_date and t_date.date() <= end_date:
+                    # Calculate Micro Metrics
+                    dec, ef1, ef2 = calculate_aerobic_decoupling(df_s)
+                    avg_p = df_s['power'].mean() if 'power' in df_s.columns else 0
+                    avg_h = df_s['heart_rate'].mean() if 'heart_rate' in df_s.columns else 0
+                    
+                    # EF Total
+                    ef_total = avg_p / avg_h if avg_h > 0 else 0
+                    
+                    db_entries.append({
+                        'Datum': t_date,
+                        'ID': uid,
+                        'Decoupling': dec,
+                        'AvgPower': avg_p,
+                        'AvgHR': avg_h,
+                        'EF': ef_total,
+                        'Duration_Min': len(df_s)/60
+                    })
+            
+            if len(db_entries) > 3:
+                df_micro = pd.DataFrame(db_entries).sort_values('Datum')
+                
+                c_m1, c_m2 = st.columns(2)
+                
+                with c_m1:
+                    st.markdown("#### 1. Aerobic Efficiency Trend")
+                    st.caption("Steigt dein EF (Output pro Herzschlag) über die Wochen?")
+                    
+                    # Chart EF
+                    chart_ef_micro = alt.Chart(df_micro).mark_circle(size=100).encode(
+                        x='Datum', 
+                        y=alt.Y('EF', scale=alt.Scale(zero=False), title="Efficiency Factor"),
+                        tooltip=['Datum', alt.Tooltip('EF', format='.2f'), 'AvgPower']
+                    )
+                    reg_ef = chart_ef_micro.transform_regression('Datum', 'EF').mark_line(color='green')
+                    st.altair_chart(chart_ef_micro + reg_ef, width="stretch")
+                    
+                    # Logic Interpretation
+                    first_ef = df_micro.iloc[:2]['EF'].mean()
+                    last_ef = df_micro.iloc[-2:]['EF'].mean()
+                    if last_ef > first_ef * 1.02:
+                        st.success("✅ **Adaptation bestätigt:** Deine Effizienz steigt. Das Training wirkt.")
+                    elif last_ef < first_ef * 0.98:
+                        st.error("❌ **Warnung:** Effizienz sinkt. Mögliche Ermüdung?")
+                    else:
+                        st.info("➡️ **Stabil:** Keine signifikante Änderung der Effizienz.")
+
+                with c_m2:
+                    st.markdown("#### 2. Decoupling bei langen Einheiten")
+                    st.caption("Verhalten des Cardiac Drifts bei Einheiten > 60min")
+                    
+                    df_long = df_micro[df_micro['Duration_Min'] > 60]
+                    if not df_long.empty:
+                        # Scatter Plot statt Bar Chart für diskrete Ereignisse auf Zeitachse
+                        base_dec = alt.Chart(df_long).encode(x='Datum')
+                        
+                        points = base_dec.mark_circle(size=150, opacity=0.8).encode(
+                            y=alt.Y('Decoupling', title='Decoupling %'),
+                            color=alt.condition(alt.datum.Decoupling < 5, alt.value('green'), alt.value('red')),
+                            tooltip=['Datum', alt.Tooltip('Decoupling', format='.2f'), 'Duration_Min']
+                        )
+                        
+                        # 5% Threshold Line (Physiologische Grenze)
+                        threshold = alt.Chart(pd.DataFrame({'y': [5]})).mark_rule(color='gray', strokeDash=[5,5]).encode(y='y')
+                        
+                        st.altair_chart(points + threshold, width="stretch")
+                    else:
+                        st.warning("Keine Einheiten > 60min in der Stream-DB gefunden.")
+
+                st.markdown("#### 3. Power Curve Shift (Week 1 vs Week 4)")
+                # Get PDCs for first week and last week in range
+                min_d = df_micro['Datum'].min()
+                max_d = df_micro['Datum'].max()
+                
+                # Helper to get max PDC from DB subset
+                def get_max_pdc(date_start, date_end):
+                    subset_ids = df_micro[(df_micro['Datum'] >= date_start) & (df_micro['Datum'] <= date_end)]['ID'].tolist()
+                    if not subset_ids: return pd.DataFrame()
+                    
+                    all_res = []
+                    for uid in subset_ids:
+                        raw_df = st.session_state.stream_db.get(uid)
+                        if raw_df is not None:
+                            pdc_s = calculate_power_curve(raw_df)
+                            all_res.append(pdc_s)
+                    
+                    if not all_res: return pd.DataFrame()
+                    full_pdc = pd.concat(all_res)
+                    # Group by Duration and take Max
+                    return full_pdc.groupby('Dauer_Sek')['Watt'].max().reset_index()
+
+                pdc_start = get_max_pdc(min_d, min_d + datetime.timedelta(days=7))
+                pdc_end = get_max_pdc(max_d - datetime.timedelta(days=7), max_d)
+                
+                if not pdc_start.empty and not pdc_end.empty:
+                    pdc_start['Phase'] = 'Woche 1'
+                    pdc_end['Phase'] = 'Woche 4'
+                    pdc_comp = pd.concat([pdc_start, pdc_end])
+                    
+                    c_pdc = alt.Chart(pdc_comp).mark_line(point=True).encode(
+                        x=alt.X('Dauer_Sek', scale=alt.Scale(type='log')),
+                        y='Watt',
+                        color='Phase',
+                        tooltip=['Dauer_Sek', 'Watt', 'Phase']
+                    )
+                    st.altair_chart(c_pdc, width="stretch")
+            else:
+                st.info("Keine Detail-Daten in DB. Bitte Synchronisation starten.")
+
 
 elif st.session_state.df is None and not start_btn and not demo_btn:
     st.info("👈 Bitte links starten.")
