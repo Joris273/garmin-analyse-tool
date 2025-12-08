@@ -60,9 +60,9 @@ def calculate_trimp_vectorized(duration_min: pd.Series, avg_hr: pd.Series, max_h
     if max_hr_user <= 0:
         return pd.Series(0.0, index=duration_min.index)
     
-    # Intensität
+    # Intensität (mit upper bound falls HR > max_hr durch fehlerhafte Sensordaten)
     intensity = avg_hr / max_hr_user
-    intensity = intensity.fillna(0).clip(lower=0)
+    intensity = intensity.fillna(0).clip(lower=0, upper=1.0)
     
     # Banister Gewichtungsfaktor (mit Skalierung 0.64 für Männer Standard)
     weighting = 0.64 * np.exp(1.92 * intensity)
@@ -142,7 +142,8 @@ def calculate_monotony_strain(df: pd.DataFrame, window_days: int = 7) -> Tuple[f
     avg_load = recent.mean()
     std_load = recent.std()
     
-    if std_load == 0 or pd.isna(std_load):
+    # Foster Monotony: Nur berechnen wenn ausreichend Last (vermeidet Rauschen bei Ruhe-Wochen)
+    if std_load == 0 or pd.isna(std_load) or avg_load < 10:
         monotony = 0.0
     else:
         monotony = avg_load / std_load
@@ -270,7 +271,8 @@ def calculate_aerobic_decoupling(df_stream: pd.DataFrame) -> Tuple[float, float,
         df['speed'] = np.where(df['power'] > 0, 1.0, 0.0)
 
     # Moving Time Filter
-    df_active = df[df['speed'] > 0.5].copy()
+    # Validierung: Filtert Rollphasen (0 Watt), um "Pedaling Decoupling" zu berechnen (Consistent with Tab 7)
+    df_active = df[(df['speed'] > 0.5) & (df['power'] > 0)].copy()
     
     if len(df_active) < 600:
         return 0.0, 0.0, 0.0
@@ -474,9 +476,9 @@ def process_data(raw_activities: List[Dict[str, Any]], user_max_hr: int) -> pd.D
             if hf_val > 105 and pwr_val < 30:
                 is_sensor_fail = True
             
-            # 2. Ratio Check (Efficiency): W/bpm < 0.55 ist extrem verdächtig (bleibt)
+            # 2. Ratio Check (Efficiency): W/bpm < 0.55 ist extrem verdächtig
             raw_ef = pwr_val / hf_val
-            if raw_ef < 0.55 and pwr_val > 50: # Check nur über 50W relevant
+            if raw_ef < 0.55 and pwr_val > 20:  # Erweitert: Auch niedrige Geisterdaten erkennen
                 is_sensor_fail = True
                 
             # 3. Variability Check: Geisterdaten sind oft Spikes + Nullen
@@ -1108,8 +1110,8 @@ if st.session_state.df is not None and not st.session_state.df.empty:
             # FIX: ACWR Berechnung muss auf der VOLLEN Historie basieren (Rolling 28d)
             daily = df_full_history.set_index('Datum').resample('D')['Stress'].sum().fillna(0).to_frame()
             daily['Acute'] = daily['Stress'].rolling(7, min_periods=1).mean()
-            # FIX Scientific: Chronic Load braucht min 7 Tage Vorlauf um "Start-Artefakte" (ACWR=1) zu vermeiden
-            daily['Chronic'] = daily['Stress'].rolling(28, min_periods=7).mean()
+            # FIX Scientific: Chronic Load min_periods=14 für statistisch valide 28-Tage Baseline (50% Rule)
+            daily['Chronic'] = daily['Stress'].rolling(28, min_periods=14).mean()
             daily['ACWR'] = np.where(daily['Chronic'] > 0, daily['Acute'] / daily['Chronic'], 0)
             daily.reset_index(inplace=True)
             
@@ -1138,6 +1140,13 @@ if st.session_state.df is not None and not st.session_state.df.empty:
             # FIX: Kopie erstellen und 0-Werte in NaN umwandeln für korrekte Mittelwerte
             # Damit werden "0 Watt" Tage (Sensor-Fix oder keine Daten) im Chart ignoriert (Lücke) statt als 0 gezeichnet
             df_trend = df_view.copy()
+            
+            # ROBUST FIX: Physiologisch unrealistische EF-Werte (< 0.6 W/bpm) sind Geisterdaten
+            # Wissenschaftlich: Selbst untrainierte Anfänger haben EF > 0.8, < 0.6 ist nur bei defekten Sensoren möglich
+            mask_ghost = df_trend['EF'] < 0.6
+            df_trend.loc[mask_ghost, ['Leistung', 'HF', 'EF']] = np.nan
+            
+            # Zusätzlich: 0-Werte zu NaN (für [Sensor-Fix] Aktivitäten)
             for c in ['Leistung', 'HF', 'EF']:
                 df_trend[c] = df_trend[c].replace(0, np.nan)
             
